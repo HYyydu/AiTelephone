@@ -17,6 +17,7 @@ export interface CallConfig {
 
 export interface Call {
   id: string;
+  user_id?: string; // Associate calls with users
   phone_number: string;
   purpose: string;
   status: CallStatus;

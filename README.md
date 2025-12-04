@@ -223,6 +223,66 @@ AiCostumerCall/
     └── .env.example                # Environment template
 ```
 
+## 🚀 Deploying to Production
+
+### Deploy to Vercel (Recommended)
+
+This project is optimized for deployment on Vercel. We've created comprehensive guides to help you:
+
+📚 **Choose your guide:**
+
+- **⚡ Quick Start (15 min)**: [QUICK_DEPLOY_VERCEL.md](./QUICK_DEPLOY_VERCEL.md)
+  - Fast track deployment guide
+  - Essential steps only
+  - Perfect for getting started quickly
+
+- **📖 Complete Guide (40 min)**: [VERCEL_DEPLOYMENT_GUIDE.md](./VERCEL_DEPLOYMENT_GUIDE.md)
+  - Detailed step-by-step walkthrough
+  - Architecture explanations
+  - Best practices and optimization tips
+  - Cost estimates and scaling advice
+
+- **🔐 Environment Setup**: [VERCEL_ENV_TEMPLATE.md](./VERCEL_ENV_TEMPLATE.md)
+  - Copy-paste templates for all environment variables
+  - Where to find credentials
+  - Security best practices
+
+- **🐛 Troubleshooting**: [VERCEL_TROUBLESHOOTING.md](./VERCEL_TROUBLESHOOTING.md)
+  - Common issues and solutions
+  - Debugging tools
+  - Pro tips
+
+- **📋 Index**: [DEPLOYMENT_INDEX.md](./DEPLOYMENT_INDEX.md)
+  - Overview of all deployment guides
+  - Quick reference checklists
+  - Learning paths
+
+**Quick Deploy Command:**
+```bash
+# 1. Push to Git
+git add .
+git commit -m "Ready for deployment"
+git push
+
+# 2. Go to vercel.com/new
+# 3. Import your repository twice:
+#    - Once with root: backend
+#    - Once with root: frontend
+# 4. Add environment variables (see guides above)
+# 5. Deploy! 🎉
+```
+
+### Alternative Deployment Options
+
+- **Railway.app**: Better for long-running WebSocket connections
+- **Render.com**: Free tier available, good for full-stack apps
+- **Traditional VPS**: DigitalOcean, AWS EC2, etc.
+- **Kubernetes**: For enterprise-scale deployments
+
+See deployment guides for more details.
+
+---
+
 ## 🔧 Configuration
 
 ### Voice Options

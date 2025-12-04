@@ -1,16 +1,19 @@
 // Call management routes
 import { Router, Request, Response } from 'express';
 import { v4 as uuidv4 } from 'uuid';
-import { store } from '../../database/models/store';
+import { CallService, TranscriptService } from '../../database/services/call-service';
 import { CreateCallRequest, Call } from '../../types';
 import { initiateCall } from '../../services/telephony';
 import { validatePhoneNumber, validateCallPurpose, sanitizeInput } from '../../utils/validation';
 import { callCreationLimiter } from '../../utils/rate-limiter';
+import { authenticateUser, requireAuth } from '../../utils/auth-middleware';
 
 const router = Router();
 
 // POST /api/calls - Create and initiate a new call
-router.post('/', callCreationLimiter, async (req: Request, res: Response) => {
+// authenticateUser extracts user from token (optional - allows unauthenticated calls)
+// requireAuth ensures user is authenticated (required for user-specific calls)
+router.post('/', authenticateUser, requireAuth, callCreationLimiter, async (req: Request, res: Response) => {
   try {
     const { phone_number, purpose, voice_preference, additional_instructions }: CreateCallRequest = req.body;
 
@@ -40,9 +43,22 @@ router.post('/', callCreationLimiter, async (req: Request, res: Response) => {
       });
     }
 
+    // Get user ID from authenticated request
+    const userId = req.user?.id;
+    if (!userId) {
+      return res.status(401).json({
+        success: false,
+        error: 'Authentication required to create calls',
+      });
+    }
+
     // Create call record with sanitized inputs
+    // All calls now use GPT-4o Realtime
+    console.log(`📝 Creating call with GPT-4o Realtime for user: ${userId}`);
+    
     const call: Call = {
       id: uuidv4(),
+      user_id: userId, // Associate call with user
       phone_number: sanitizeInput(phone_number, 20),
       purpose: sanitizeInput(purpose, 500),
       status: 'queued',
@@ -50,18 +66,20 @@ router.post('/', callCreationLimiter, async (req: Request, res: Response) => {
       voice_preference: voice_preference || 'professional_female',
       additional_instructions: additional_instructions ? sanitizeInput(additional_instructions, 500) : undefined,
     };
+    
+    console.log(`✅ Call created: ${call.id}, user_id: ${call.user_id}`);
 
     // Save to database
-    store.createCall(call);
+    await CallService.createCall(call);
 
     // Initiate the call (async, don't wait)
     initiateCall(call)
       .then(() => {
         console.log(`✅ Call initiated successfully: ${call.id}`);
       })
-      .catch((error) => {
+      .catch(async (error) => {
         console.error(`❌ Failed to initiate call: ${call.id}`, error);
-        store.updateCall(call.id, { status: 'failed' });
+        await CallService.updateCall(call.id, { status: 'failed' });
       });
 
     res.status(201).json({
@@ -79,14 +97,20 @@ router.post('/', callCreationLimiter, async (req: Request, res: Response) => {
   }
 });
 
-// GET /api/calls - Get all calls
-router.get('/', (req: Request, res: Response) => {
+// GET /api/calls - Get all calls (filtered by authenticated user)
+router.get('/', authenticateUser, async (req: Request, res: Response) => {
   try {
-    const calls = store.getAllCalls();
+    // Get user ID from authenticated request (if available)
+    const userId = req.user?.id;
+    
+    // Only return calls for the authenticated user
+    // If no user is authenticated, return empty array
+    const callsList = userId ? await CallService.getAllCalls(userId) : [];
+    
     res.json({
       success: true,
-      calls,
-      count: calls.length,
+      calls: callsList,
+      count: callsList.length,
     });
   } catch (error) {
     console.error('Error fetching calls:', error);
@@ -97,11 +121,14 @@ router.get('/', (req: Request, res: Response) => {
   }
 });
 
-// GET /api/calls/:id - Get a specific call
-router.get('/:id', (req: Request, res: Response) => {
+// GET /api/calls/:id - Get a specific call (only if it belongs to the authenticated user)
+router.get('/:id', authenticateUser, async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
-    const call = store.getCall(id);
+    const userId = req.user?.id;
+    
+    // Get call, filtering by user_id if user is authenticated
+    const call = await CallService.getCall(id, userId);
 
     if (!call) {
       return res.status(404).json({
@@ -123,11 +150,14 @@ router.get('/:id', (req: Request, res: Response) => {
   }
 });
 
-// GET /api/calls/:id/transcripts - Get transcripts for a call
-router.get('/:id/transcripts', (req: Request, res: Response) => {
+// GET /api/calls/:id/transcripts - Get transcripts for a call (only if it belongs to the authenticated user)
+router.get('/:id/transcripts', authenticateUser, async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
-    const call = store.getCall(id);
+    const userId = req.user?.id;
+    
+    // Get call, filtering by user_id if user is authenticated
+    const call = await CallService.getCall(id, userId);
 
     if (!call) {
       return res.status(404).json({
@@ -136,7 +166,7 @@ router.get('/:id/transcripts', (req: Request, res: Response) => {
       });
     }
 
-    const transcripts = store.getTranscripts(id);
+    const transcripts = await TranscriptService.getTranscripts(id);
 
     res.json({
       success: true,
@@ -152,10 +182,11 @@ router.get('/:id/transcripts', (req: Request, res: Response) => {
   }
 });
 
-// GET /api/calls/stats/summary - Get call statistics
-router.get('/stats/summary', (req: Request, res: Response) => {
+// GET /api/calls/stats/summary - Get call statistics (filtered by authenticated user)
+router.get('/stats/summary', authenticateUser, async (req: Request, res: Response) => {
   try {
-    const stats = store.getStats();
+    const userId = req.user?.id;
+    const stats = await CallService.getStats(userId);
     res.json({
       success: true,
       stats,
@@ -169,11 +200,22 @@ router.get('/stats/summary', (req: Request, res: Response) => {
   }
 });
 
-// DELETE /api/calls/:id - Delete a call (for testing)
-router.delete('/:id', (req: Request, res: Response) => {
+// DELETE /api/calls/:id - Delete a call (only if it belongs to the authenticated user)
+router.delete('/:id', authenticateUser, requireAuth, async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
-    const deleted = store.deleteCall(id);
+    const userId = req.user?.id;
+    
+    // Verify the call belongs to the user before deleting
+    const call = await CallService.getCall(id, userId);
+    if (!call) {
+      return res.status(404).json({
+        success: false,
+        error: 'Call not found',
+      });
+    }
+    
+    const deleted = await CallService.deleteCall(id);
 
     if (!deleted) {
       return res.status(404).json({

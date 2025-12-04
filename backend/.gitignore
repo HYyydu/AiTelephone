@@ -11,6 +11,11 @@ build/
 .env
 .env.local
 .env.production
+.env.backup
+.env.bak
+.env.bak2
+*.env.backup
+*.env.bak*
 
 # Logs
 logs/
