@@ -4,8 +4,6 @@ node_modules
 !.env.example
 *.log
 .DS_Store
-src
-tsconfig.json
 nodemon.json
 *.test.ts
 *.spec.ts
