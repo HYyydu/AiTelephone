@@ -30,6 +30,10 @@ testConnection().then((connected) => {
 const app: Express = express();
 const httpServer = createServer(app);
 
+// Trust proxy - Required for Railway, Vercel, and other hosting platforms
+// This allows express-rate-limit and other middleware to correctly identify client IPs
+app.set('trust proxy', 1);
+
 // Socket.io setup for frontend real-time updates
 export const io = new SocketIOServer(httpServer, {
   cors: {
