@@ -33,8 +33,37 @@ const httpServer = createServer(app);
 // Socket.io setup for frontend real-time updates
 export const io = new SocketIOServer(httpServer, {
   cors: {
-    origin: config.cors.origin,
+    origin: (origin, callback) => {
+      // Allow requests with no origin
+      if (!origin) return callback(null, true);
+      
+      // Allow all Vercel deployments for ai-telephone-front
+      const allowedOrigins = [
+        'https://ai-telephone-front.vercel.app',
+        /^https:\/\/ai-telephone-front-.*\.vercel\.app$/,
+        /^https:\/\/ai-telephone-front-git-.*\.vercel\.app$/,
+        config.cors.origin,
+        'http://localhost:3000',
+      ];
+      
+      const isAllowed = allowedOrigins.some(allowed => {
+        if (typeof allowed === 'string') {
+          return origin === allowed;
+        } else if (allowed instanceof RegExp) {
+          return allowed.test(origin);
+        }
+        return false;
+      });
+      
+      if (isAllowed) {
+        callback(null, true);
+      } else {
+        console.warn(`⚠️  Socket.io CORS blocked: ${origin}`);
+        callback(new Error('Not allowed by CORS'));
+      }
+    },
     methods: ["GET", "POST"],
+    credentials: true,
   },
 });
 
@@ -128,7 +157,36 @@ httpServer.on("upgrade", (request, socket, head) => {
 // Middleware
 app.use(
   cors({
-    origin: config.cors.origin,
+    origin: (origin, callback) => {
+      // Allow requests with no origin (mobile apps, Postman, etc.)
+      if (!origin) return callback(null, true);
+      
+      // Allow all Vercel deployments for ai-telephone-front
+      const allowedOrigins = [
+        'https://ai-telephone-front.vercel.app',
+        /^https:\/\/ai-telephone-front-.*\.vercel\.app$/,  // Preview deployments
+        /^https:\/\/ai-telephone-front-git-.*\.vercel\.app$/,  // Git branch deployments
+        config.cors.origin,  // Also allow configured origin
+        'http://localhost:3000',  // Local development
+      ];
+      
+      // Check if origin matches any allowed pattern
+      const isAllowed = allowedOrigins.some(allowed => {
+        if (typeof allowed === 'string') {
+          return origin === allowed;
+        } else if (allowed instanceof RegExp) {
+          return allowed.test(origin);
+        }
+        return false;
+      });
+      
+      if (isAllowed) {
+        callback(null, true);
+      } else {
+        console.warn(`⚠️  CORS blocked request from origin: ${origin}`);
+        callback(new Error('Not allowed by CORS'));
+      }
+    },
     credentials: true,
   })
 );
