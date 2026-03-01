@@ -24,7 +24,17 @@ router.get(
   authenticateUser,
   async (req: Request, res: Response): Promise<void> => {
     try {
-      const { quoteType } = req.params;
+      const quoteType =
+        typeof req.params.quoteType === "string"
+          ? req.params.quoteType
+          : undefined;
+      if (!quoteType) {
+        res.status(400).json({
+          success: false,
+          error: "Invalid quote type",
+        });
+        return;
+      }
       const schema = getSchema(quoteType);
       if (!schema) {
         res.status(404).json({
