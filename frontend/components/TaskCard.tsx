@@ -1,12 +1,24 @@
+"use client";
+
+import { useState } from "react";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import {
   Clock,
   Phone,
   MessageCircle,
   ExternalLink,
   AlertCircle,
+  Trash2,
 } from "lucide-react";
 
 export interface Task {
@@ -28,6 +40,7 @@ export interface Task {
   channel?: "call" | "chat" | "form" | "email";
   holdTime?: string;
   transcript?: string;
+  priority?: "high" | "medium" | "low";
   callSummary?: {
     duration: string;
     holdTime: string;
@@ -40,6 +53,7 @@ interface TaskCardProps {
   task: Task;
   onViewDetails?: (taskId: string) => void;
   onTakeAction?: (taskId: string) => void;
+  onDelete?: (taskId: string) => void;
 }
 
 const statusConfig = {
@@ -108,9 +122,21 @@ const getVendorColor = (vendor: string): string => {
   return "bg-gradient-to-br from-blue-500 to-indigo-600";
 };
 
-export function TaskCard({ task, onViewDetails, onTakeAction }: TaskCardProps) {
+export function TaskCard({ task, onViewDetails, onTakeAction, onDelete }: TaskCardProps) {
   const config = statusConfig[task.status];
   const StatusIcon = config.icon;
+  const [showDeleteDialog, setShowDeleteDialog] = useState(false);
+
+  const handleDeleteClick = () => {
+    setShowDeleteDialog(true);
+  };
+
+  const handleConfirmDelete = () => {
+    if (onDelete) {
+      onDelete(task.id);
+      setShowDeleteDialog(false);
+    }
+  };
 
   return (
     <Card className="shadow-md hover:shadow-lg transition-shadow">
@@ -208,10 +234,46 @@ export function TaskCard({ task, onViewDetails, onTakeAction }: TaskCardProps) {
                   Details
                 </Button>
               )}
+              {onDelete && (
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  onClick={handleDeleteClick}
+                  className="text-red-600 hover:text-red-700 hover:bg-red-50"
+                >
+                  <Trash2 className="w-3 h-3" />
+                </Button>
+              )}
             </div>
           </div>
         </div>
       </CardContent>
+
+      {/* Delete Confirmation Dialog */}
+      <Dialog open={showDeleteDialog} onOpenChange={setShowDeleteDialog}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Delete Task</DialogTitle>
+            <DialogDescription>
+              Are you sure you want to delete this task for {task.vendor}? This action cannot be undone.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => setShowDeleteDialog(false)}
+            >
+              Cancel
+            </Button>
+            <Button
+              variant="destructive"
+              onClick={handleConfirmDelete}
+            >
+              Delete
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </Card>
   );
 }

@@ -26,6 +26,7 @@ export class RealtimeAPIConnection {
   private realtimeConfig: RealtimeConfig;
   private messageHandlers: Map<string, (data: any) => void> = new Map();
   private isConnected: boolean = false;
+  private keepaliveInterval: NodeJS.Timeout | null = null;
 
   constructor(realtimeConfig: RealtimeConfig = {}) {
     this.realtimeConfig = {
@@ -72,6 +73,19 @@ export class RealtimeAPIConnection {
       this.ws.on("open", () => {
         console.log("✅ OpenAI Realtime API WebSocket connected");
         this.isConnected = true;
+
+        // Start keepalive ping to prevent timeout (every 20 seconds)
+        // OpenAI Realtime API requires periodic pings to keep connection alive
+        this.keepaliveInterval = setInterval(() => {
+          if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+            try {
+              this.ws.ping();
+            } catch (error) {
+              console.warn("⚠️  Error sending keepalive ping:", error);
+            }
+          }
+        }, 20000); // 20 seconds - OpenAI typically times out after 30-60 seconds of inactivity
+
         resolve(this.ws!);
       });
 
@@ -97,6 +111,13 @@ export class RealtimeAPIConnection {
           `🔴 OpenAI Realtime API WebSocket closed: ${code} ${reason}`
         );
         this.isConnected = false;
+
+        // Clear keepalive interval
+        if (this.keepaliveInterval) {
+          clearInterval(this.keepaliveInterval);
+          this.keepaliveInterval = null;
+        }
+
         this.ws = null;
       });
     });
@@ -116,8 +137,10 @@ export class RealtimeAPIConnection {
     console.log(`   - Voice: ${this.realtimeConfig.voice}`);
     console.log(`   - Audio format: PCM16, 24kHz`);
     console.log(`   - Transcription: Enabled (whisper-1)`);
-    console.log(`   - VAD Threshold: ${process.env.OPENAI_VAD_THRESHOLD || "0.05"}`);
-    
+    console.log(
+      `   - VAD Threshold: ${process.env.OPENAI_VAD_THRESHOLD || "0.05"}`
+    );
+
     const sessionConfig = {
       type: "session.update",
       session: {
@@ -316,6 +339,12 @@ export class RealtimeAPIConnection {
    * Close connection
    */
   close() {
+    // Clear keepalive interval
+    if (this.keepaliveInterval) {
+      clearInterval(this.keepaliveInterval);
+      this.keepaliveInterval = null;
+    }
+
     if (this.ws) {
       // Close the WebSocket directly - don't send invalid session update
       // The API doesn't allow empty modalities array

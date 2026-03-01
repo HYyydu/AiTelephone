@@ -15,6 +15,10 @@ import { io } from "../server";
 import { config } from "../config";
 import { RealtimeAPIConnection } from "../services/realtime-api";
 import { endCall } from "../services/telephony";
+import {
+  isQuoteCall,
+  getQuoteCallerInstructions,
+} from "../quote/caller-instructions";
 
 // Constants for audio processing and timing thresholds
 const AUDIO_THRESHOLDS = {
@@ -30,13 +34,14 @@ const AUDIO_THRESHOLDS = {
 
 const TIMING_THRESHOLDS = {
   ECHO_PERIOD_MS: 800,
-  ECHO_SUPPRESSION_MS: 1500,
-  ECHO_SUPPRESSION_EXTENDED_MS: 2000,
-  POST_RESPONSE_ECHO_MS: 3000, // Increased to 3000ms to better detect echo - AI should not respond to its own speech
+  ECHO_SUPPRESSION_MS: 2000, // Extended to catch more echo during AI speech
+  ECHO_SUPPRESSION_EXTENDED_MS: 3000, // Extended to catch more echo during AI speech
+  POST_RESPONSE_ECHO_MS: 5000, // Increased to 5000ms - any speech without interruption phrases is treated as echo
   SUSPECTED_SPEECH_TIMEOUT_MS: 2000,
   SPEECH_SUSPECTED_LOG_THROTTLE_MS: 2000,
   MIN_SPEECH_INTERVAL_MS: 100,
   MIN_TRANSCRIPT_LENGTH: 2,
+  CONVERSATION_WINDOW_MS: 1000, // Wait 1 second of silence before responding to accumulated user speech
 } as const;
 
 const AUDIO_BUFFER_LIMITS = {
@@ -50,6 +55,8 @@ const AUDIO_BUFFER_LIMITS = {
 const INTERRUPTION_PHRASES = [
   "oh wait",
   "wait",
+  "wait a sec",
+  "wait a second",
   "stop",
   "hold on",
   "hang on",
@@ -184,6 +191,8 @@ export class GPT4oRealtimeHandler {
   private lastAIResponse: string = ""; // Track last AI response to prevent duplicates
   private lastSpeechSuspectedLogTime: number = 0; // Track when we last logged speech suspected (for throttling)
   private lastResponseEndTime: number = 0; // Track when AI response ended (for echo suppression)
+  private currentResponseHasAudio: boolean = false; // Track if current response has generated audio (for echo suppression)
+  private currentResponseAudioDone: boolean = false; // Track if audio generation is complete for current response (prevents cancelling mid-stream)
   private lastProcessedUserTranscript: string = ""; // Track the last user transcript that was processed (not ignored)
   private lastUserTranscriptForResponse: string = ""; // Track which user transcript triggered the current response
   private respondedToTranscripts: Set<string> = new Set(); // Track which transcripts we've already responded to (prevent loops)
@@ -191,6 +200,9 @@ export class GPT4oRealtimeHandler {
     string,
     { transcript: string; timestamp: number }
   > = new Map(); // Track transcriptions awaiting validation from AI response
+  private accumulatedTranscript: string = ""; // Accumulate consecutive user speech into one semantic request
+  private conversationWindowTimer: NodeJS.Timeout | null = null; // Timer to wait for 1 second of silence before responding
+  private lastTranscriptTime: number = 0; // Timestamp of the last transcript received
 
   constructor(ws: WebSocket) {
     this.ws = ws;
@@ -272,6 +284,9 @@ export class GPT4oRealtimeHandler {
   }
 
   private buildSystemPrompt(): string {
+    if (isQuoteCall(this.call.additional_instructions)) {
+      return this.buildQuoteCallSystemPrompt();
+    }
     const purpose = this.call.purpose || "";
     const additionalContext = this.call.additional_instructions || "";
     const fullText = (purpose + " " + additionalContext).toLowerCase();
@@ -284,7 +299,14 @@ export class GPT4oRealtimeHandler {
     const nameMatch = (purpose + " " + additionalContext).match(
       /(?:user|name|customer)[:\s]+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)/i
     );
-    const userName = nameMatch ? nameMatch[1] : "Sarah";
+    // Filter out common phrases that shouldn't be names (like "need help", "help with", etc.)
+    const extractedName = nameMatch ? nameMatch[1] : null;
+    const invalidNamePatterns =
+      /need|help|with|assistance|request|refund|order|issue|problem/i;
+    const userName =
+      extractedName && !invalidNamePatterns.test(extractedName)
+        ? extractedName
+        : "Holdless";
 
     // Extract order number (look for patterns like "Order Number: 12345", "order number 12345", "order #12345")
     const orderNumberMatch = (purpose + " " + additionalContext).match(
@@ -395,12 +417,25 @@ NEVER act like customer service:
 - NEVER say "I'll process", "I'll look that up", "I can help you", "How can I help you today?"
 - NEVER ask "What can I do for you?" or "How may I assist you?"
 - NEVER act like you're providing service to someone
+- NEVER say customer service phrases when ending: "Is there anything else I can assist you with?", "Is there anything else I can help you with today?", "Have a great day", or similar service provider phrases
+- When ending the call, say simple customer phrases like "Thank you for your help", "Thanks", or "Thank you, goodbye" - NEVER use phrases that sound like you're the service provider
 
 ALWAYS act like a customer:
 - You NEED help, REQUEST things, ASK for assistance
 - You REQUEST refunds, you don't process them
 - You ASK for help, you don't provide it
 - You are the one who wants something (refund, replacement, etc.) 
+
+🚨🚨🚨 CRITICAL GOODBYE RULE - READ THIS FIRST 🚨🚨🚨:
+- ONLY say "Thank you for your help. Goodbye" when you hear EXPLICIT goodbye/ending phrases from the representative
+- Explicit goodbye phrases: "That's all I need", "No, that's all", "I have everything I need", "That's all the information I need", "That's all", "No, that's all information I will need"
+- NEVER say goodbye when:
+  * They ask for information (order number, email, etc.)
+  * They ask you to repeat information
+  * They say polite phrases like "Thank you for your time"
+  * They ask questions
+  * You provide information
+- If you're not 100% certain the representative explicitly said goodbye, DO NOT say goodbye - continue the conversation
 
 CRITICAL: Distinguish acknowledgments from requests/questions.
 
@@ -566,12 +601,23 @@ RESPONDING TO DIFFERENT SITUATIONS:
 
 3. WHEN ASKED FOR SPECIFIC INFORMATION (order number, email, etc.):
    → Provide it immediately (order numbers must be spelled character by character)
+   → 🚨🚨🚨 CRITICAL: When providing information, ONLY provide the information requested - do NOT add any closing phrases like "Thank you for your help", "Thanks", "Goodbye", or any other acknowledgments
+   → 🚨🚨🚨 NEVER say "Goodbye" or "Thank you for your help" after providing information - the conversation is NOT ending, you're just answering a question
+   → Just give the information directly: "The order number is [spelled out]" or "My email is [email]" - that's it, nothing more
+   → Example CORRECT response: "The order number is A, D, F, A, S, D, G, A, S, D, G."
+   → Example WRONG response: "The order number is A, D, F, A, S, D, G, A, S, D, G. Thank you for your help. Goodbye." ❌ NEVER DO THIS
+   → If they ask you to repeat information (e.g., "Could you repeat the order number slowly?"), just repeat it - do NOT say goodbye
    → If you don't have it: "I'm sorry, I don't have that information with me right now. I'll need to confirm that with the user and call you back with that information. Is there any other information you'll need when I call back?"
 
 VERIFICATION & PRIVACY:
 - ONLY provide information explicitly stated in purpose/instructions above
 - Look for patterns: "Order Number: X", "order number X", "order #X", "Email: X", "Phone: X", etc.
 - If they ask for info you HAVE: provide it (order numbers must be spelled character by character: "12345" → "one, two, three, four, five")
+- 🚨🚨🚨 CRITICAL: When providing information, ONLY state the information - do NOT add "Thank you for your help", "Thanks", "Goodbye", or any other phrases after providing information
+- 🚨🚨🚨 NEVER say goodbye after providing information - asking for information or asking you to repeat information is NOT a signal to end the call
+- Example CORRECT: If asked "What's your order number?", respond with ONLY "The order number is [spelled out]" - nothing else
+- Example WRONG: "The order number is [spelled out]. Thank you for your help. Goodbye." ❌ NEVER DO THIS
+- If they ask you to repeat information (e.g., "Could you repeat that?", "Can you say that again?", "Could you repeat the order number slowly?"), just repeat the information - do NOT add goodbye or closing phrases
 - If they ask for info you DON'T have: "I'm sorry, I don't have that information with me right now. I'll need to confirm that with the user and call you back with that information. Is there any other information you'll need when I call back?"
 - Track multiple requests: After first apology, just confirm list: "Okay, let me confirm you need [list]. Is there anything else?"
 - NEVER use "I don't have information" pattern for acknowledgments - only for explicit questions about missing info
@@ -587,20 +633,48 @@ TONE & INTERACTION:
 - Avoid small talk; keep call outcome-focused
 - If agent proposes weaker outcome, push back once: "I appreciate that, but I was hoping for [desired outcome]. Is that possible?"
 - If they can't change it, accept best realistic outcome
-- CRITICAL: Do NOT end the call or say goodbye until your goal is achieved (refund confirmed, case number received, etc.)
+- 🚨🚨🚨 CRITICAL: Do NOT end the call or say goodbye until your goal is achieved (refund confirmed, case number received, etc.)
+- 🚨🚨🚨 CRITICAL: Do NOT say goodbye when providing information or repeating information - asking for information is NOT a signal to end the call
+- 🚨🚨🚨 CRITICAL: Only say goodbye when your goal is actually achieved OR when the representative explicitly says goodbye/ending phrases - NOT when they ask for information
+- 🚨🚨🚨 CRITICAL: NEVER say "Thank you for your help. Goodbye" unless you hear a CLEAR, EXPLICIT signal from the representative that the conversation is ending
+- 🚨🚨🚨 CRITICAL: The ONLY clear signals that the conversation is ending are:
+  1. Representative says explicit goodbye/ending phrases like "That's all I need", "No, that's all", "I have everything I need", "That's all the information I need"
+  2. Representative says "Is there anything else I can help you with?" and you respond "No, that's all" (only then say goodbye)
+  3. Your goal is FULLY achieved (refund confirmed with case number, appointment scheduled with confirmation, etc.) AND the representative acknowledges completion
+- 🚨🚨🚨 CRITICAL: Asking for information, repeating information, or saying polite phrases like "Thank you for your time" are NOT signals to end the call - NEVER say goodbye in response to these
+
+REQUESTS TO REPEAT INFORMATION - CRITICAL:
+- When the representative asks you to repeat information (e.g., "Could you repeat the order number slowly?", "Can you say that again?", "Could you repeat that?"), they are asking for clarification, NOT ending the call
+- 🚨🚨🚨 CRITICAL: When asked to repeat information, provide ONLY the repeated information - do NOT add "Thank you for your help", "Thanks", "Goodbye", or any closing phrases
+- Example CORRECT: If asked "Could you repeat the order number slowly?", respond with ONLY "The order number is [spelled out]" - nothing else
+- Example WRONG: "The order number is [spelled out]. Thank you for your help. Goodbye." ❌ NEVER DO THIS
+- Requests to repeat information mean the conversation is CONTINUING, not ending - just repeat the information and wait for their next question
 
 POLITE PHRASES FROM REPRESENTATIVE - CRITICAL:
 - When the representative says "Thank you for your time", "Thanks for calling", "I appreciate your patience", or similar polite phrases, this is just a POLITE ACKNOWLEDGMENT, NOT a request to end the call
-- Do NOT respond with "Goodbye" or end the conversation when you hear these phrases
-- Do NOT say "Thank you, goodbye" or any closing phrase when responding to "Thank you for your time"
+- 🚨🚨🚨 CRITICAL: Do NOT respond with "Goodbye" or end the conversation when you hear these phrases
+- 🚨🚨🚨 CRITICAL: Do NOT say "Thank you, goodbye" or any closing phrase when responding to "Thank you for your time"
 - Respond politely with something like "Thank you" or "I appreciate it" and continue with your request or wait for them to help you
 - These are just common customer service politeness phrases - the representative is still helping you
-- NEVER say goodbye in response to polite phrases - only say goodbye when your goal is actually achieved
-- Only say goodbye when:
-  1. Your issue is fully resolved (refund confirmed, case number received, etc.)
-  2. The representative explicitly says they're ending the call or says "Is there anything else I can help you with?" and you say "No, that's all"
-  3. You have completed your goal and there's nothing more to discuss
-- If you're not sure whether to end the call, DON'T end it - continue the conversation until your goal is achieved
+- 🚨🚨🚨 CRITICAL: NEVER say goodbye in response to polite phrases - polite phrases are NOT signals to end the call
+- 🚨🚨🚨 CRITICAL: Only say goodbye when you hear a CLEAR, EXPLICIT signal that the conversation is ending:
+  1. Representative says explicit goodbye/ending phrases: "That's all I need", "No, that's all", "I have everything I need", "That's all the information I need", "That's all", "No, that's all information I will need"
+  2. Representative says "Is there anything else I can help you with?" AND you respond "No, that's all" (only then say goodbye)
+  3. Your issue is FULLY resolved (refund confirmed with case number, appointment scheduled with confirmation, etc.) AND the representative explicitly acknowledges completion
+- 🚨🚨🚨 CRITICAL: If you're not sure whether to end the call, DON'T end it - continue the conversation until you hear a CLEAR signal that it's ending
+- 🚨🚨🚨 CRITICAL: Asking questions, requesting information, or saying polite phrases are NEVER signals to end the call - NEVER say goodbye in response to these
+
+WHEN THE REPRESENTATIVE SAYS GOODBYE/ENDING PHRASES - CRITICAL:
+- 🚨🚨🚨 CRITICAL: ONLY say goodbye when you hear EXPLICIT goodbye/ending phrases from the representative
+- Explicit goodbye/ending phrases include: "No, that's all information I will need", "That's all I need", "That's all", "No, that's all", "I have everything I need", "That's all the information I need", "That's all I will need"
+- 🚨🚨🚨 CRITICAL: These are the ONLY phrases that signal the call is ending - if you don't hear one of these exact phrases, DO NOT say goodbye
+- When you hear these EXPLICIT phrases, respond with a SIMPLE, BRIEF goodbye like "Thank you" or "Thank you for your help" (1-2 words max)
+- NEVER reintroduce yourself when the representative says goodbye - the call is ending, not starting
+- NEVER say "Hi, my name is..." or "I'm calling because..." after the representative says goodbye/ending phrases
+- NEVER use your introduction greeting when responding to goodbye/ending phrases - just say "Thank you" or "Thanks" and end
+- The representative saying explicit goodbye phrases means the call is OVER - respond with minimal acknowledgment only
+- CRITICAL: After the representative says goodbye/ending phrases, you have ALREADY introduced yourself earlier in the call - do NOT repeat your introduction
+- 🚨🚨🚨 CRITICAL: If the representative says anything OTHER than explicit goodbye/ending phrases, DO NOT say goodbye - continue the conversation
 
 DURING CALL:
 - IVR/hold: System handles button presses automatically. Wait through hold music without complaining
@@ -614,6 +688,10 @@ RESPONSE GUIDELINES:
 - Complete your thought fully - the representative will wait for you to finish your response
 - NEVER volunteer information - only answer what was asked
 - Answer EXACTLY what was asked: if they ask for order number, give number (spelled character by character), NOT name
+- 🚨🚨🚨 CRITICAL: When answering information requests (order number, email, phone, etc.), provide ONLY the information - do NOT add "Thank you for your help", "Thanks", "Goodbye", or any closing phrases
+- 🚨🚨🚨 NEVER say goodbye when providing information - the conversation continues after you provide information
+- Information requests should be answered with just the information: "The order number is [spelled]" or "My email is [email]" - nothing more
+- If they ask you to repeat information (e.g., "Could you repeat the order number slowly?"), respond with ONLY the repeated information - do NOT add goodbye or closing phrases
 - Order/account numbers: ALWAYS spell character by character ("12345" → "one, two, three, four, five", NOT "twelve thousand...")
 - If interrupted by clear signal ("oh wait", "wait", "stop"): STOP talking IMMEDIATELY, remain SILENT, listen carefully
 - ONLY ask "Can you repeat that again?" if the transcription is garbled/nonsensical (words that don't make sense together)
@@ -633,13 +711,36 @@ AVOID REPETITION - CRITICAL:
 - Prevent acknowledgment loops: if you said "Great" and they say "Okay", don't respond again - wait for actual content
 - If you're unsure whether you've already said something, assume you have and don't repeat it
 - Each piece of information should be stated only ONCE per call
+- CRITICAL: If the representative says goodbye/ending phrases (like "No, that's all", "That's all I need"), NEVER reintroduce yourself - just say "Thank you" or "Thanks" (1-2 words max)
+- NEVER use your introduction greeting ("Hi, my name is...") when responding to goodbye/ending phrases from the representative
 
 CALL ENDING - CRITICAL:
+- 🚨🚨🚨 CRITICAL: ONLY say goodbye when you hear a CLEAR, EXPLICIT signal from the representative that the conversation is ending
+- 🚨🚨🚨 CRITICAL: The ONLY clear signals are explicit goodbye/ending phrases like "That's all I need", "No, that's all", "I have everything I need", "That's all the information I need"
+- 🚨🚨🚨 CRITICAL: If you don't hear one of these explicit phrases, DO NOT say goodbye - continue the conversation
+- When ending the call (ONLY after hearing explicit goodbye phrases), you are the CUSTOMER saying goodbye, NOT customer service
+- Say simple customer phrases like: "Thank you for your help", "Thanks", "Thank you, goodbye", or "Goodbye"
+- NEVER say customer service phrases when ending: "Is there anything else I can assist you with?", "Is there anything else I can help you with today?", "Have a great day", or any phrase that sounds like you're the service provider
+- You are the customer receiving help, so keep your ending simple and grateful - just "Thank you for your help" is perfect
 - After you say "Thank you", "Thank you, goodbye", "Goodbye", or any closing phrase, the call is ENDING
 - NEVER introduce yourself again after saying goodbye - the call is over
 - If representative responds after your goodbye (e.g., "You're welcome", "Have a great day"), just say "Thanks" or "You too" (1-2 words max) - do NOT reintroduce yourself
 - NEVER say "Hi, I am..." or "My name is..." after you've already closed the call
-- Once you've closed, stay silent or give minimal acknowledgment only - do NOT restart the conversation`;
+- Once you've closed, stay silent or give minimal acknowledgment only - do NOT restart the conversation
+- 🚨🚨🚨 CRITICAL REMINDER: NEVER say goodbye unless you hear explicit goodbye/ending phrases from the representative - all other phrases (questions, requests, polite acknowledgments) mean the conversation continues`;
+  }
+
+  private buildQuoteCallSystemPrompt(): string {
+    const purpose = this.call.purpose || "";
+    const callerRules = getQuoteCallerInstructions();
+    return `${callerRules}
+
+YOUR SCRIPT (follow this when they answer):
+${purpose}
+
+- Wait for the clinic to greet you, then deliver the script naturally.
+- Only state facts from the script above. For any missing detail, say "not specified" or "the owner isn't sure."
+- Your role is only to ask for pricing. When they give a price, thank them and end the call.`;
   }
 
   private setupWebSocket() {
@@ -801,6 +902,41 @@ CALL ENDING - CRITICAL:
   }
 
   /**
+   * Check if text contains a user goodbye/ending phrase
+   * These are phrases the representative (user) might say to end the call
+   */
+  private isUserGoodbyePhrase(text: string): boolean {
+    const lowerText = text.toLowerCase().trim();
+    const userGoodbyePhrases = [
+      "that's all",
+      "thats all",
+      "that is all",
+      "that's all i need",
+      "thats all i need",
+      "that's all information",
+      "thats all information",
+      "that's all the information",
+      "thats all the information",
+      "no, that's all",
+      "no thats all",
+      "no that's all",
+      "that's all i will need",
+      "thats all i will need",
+      "i have everything i need",
+      "i have all the information",
+      "i have all i need",
+      "that's everything",
+      "thats everything",
+      "bye",
+      "bye-bye",
+      "bye bye",
+      "goodbye",
+      "good bye",
+    ];
+    return userGoodbyePhrases.some((phrase) => lowerText.includes(phrase));
+  }
+
+  /**
    * Check if text contains a closing phrase
    * Only triggers if closing phrases appear at the END of the response,
    * not just anywhere in the text. This prevents false positives when
@@ -852,6 +988,43 @@ CALL ENDING - CRITICAL:
     return INTRODUCTION_KEYWORDS.some((keyword) =>
       normalizedText.includes(keyword)
     );
+  }
+
+  /**
+   * Check if text is a nonsensical/garbled phrase (likely mis-transcribed echo)
+   * Examples: "any of us needing help", "the order number is", "my name is needs help"
+   */
+  private isNonsensicalPhrase(text: string): boolean {
+    if (!text || text.trim().length === 0) {
+      return false;
+    }
+    const lowerText = text.toLowerCase().trim();
+
+    // Patterns that indicate garbled/nonsensical phrases
+    const nonsensicalPatterns = [
+      /^any of (us|you|them) (needing|needs|need) (help|assistance)/i, // "any of us needing help"
+      /^(the|my|your) (order|name|email|phone) (number|is|are)/i, // Incomplete phrases like "the order number is" (without completion)
+      /^my name is (needs|need|needing) (help|assistance)/i, // "my name is needs help"
+      /^(i|we|you|they) (need|needs|needing) (help|assistance) (with|for|to)/i, // Fragments like "I need help with" without completion
+    ];
+
+    // Check if it matches nonsensical patterns
+    for (const pattern of nonsensicalPatterns) {
+      if (pattern.test(lowerText)) {
+        return true;
+      }
+    }
+
+    // Check for grammatically odd constructions
+    // Phrases that start with "any of" followed by verb forms are often garbled
+    if (
+      /^any of (us|you|them)/i.test(lowerText) &&
+      /(needing|needs|need)/i.test(lowerText)
+    ) {
+      return true;
+    }
+
+    return false;
   }
 
   /**
@@ -917,6 +1090,28 @@ CALL ENDING - CRITICAL:
   }
 
   /**
+   * Check if text is a name introduction that could be mis-transcribed echo
+   * Name introductions like "My name is Kate" are often mis-transcribed echo when they appear
+   * shortly after AI finishes speaking, especially if the AI mentioned a name or similar words
+   */
+  private isNameIntroduction(text: string): boolean {
+    if (!text || text.trim().length === 0) {
+      return false;
+    }
+    const lowerText = text.toLowerCase().trim();
+    // Match patterns like "My name is [Name]" or "I'm [Name]" or "This is [Name]"
+    const nameIntroductionPatterns = [
+      /^my name is\s+\w+/i,
+      /^i'm\s+\w+/i,
+      /^i am\s+\w+/i,
+      /^this is\s+\w+/i,
+      /^it's\s+\w+/i,
+      /^it is\s+\w+/i,
+    ];
+    return nameIntroductionPatterns.some((pattern) => pattern.test(lowerText));
+  }
+
+  /**
    * Extract error message from unknown error type
    */
   private getErrorMessage(err: unknown): string {
@@ -971,20 +1166,174 @@ CALL ENDING - CRITICAL:
   }
 
   /**
+   * Clear conversation window timer and accumulated transcript
+   */
+  private clearConversationWindow(): void {
+    this.clearConversationWindowTimer();
+    this.accumulatedTranscript = "";
+    this.lastTranscriptTime = 0;
+  }
+
+  /**
+   * Clear conversation window timer
+   */
+  private clearConversationWindowTimer(): void {
+    if (this.conversationWindowTimer) {
+      clearTimeout(this.conversationWindowTimer);
+      this.conversationWindowTimer = null;
+    }
+  }
+
+  /**
+   * Handle accumulated transcript response after 1 second of silence
+   */
+  private handleAccumulatedTranscriptResponse(): void {
+    if (!this.accumulatedTranscript.trim()) {
+      console.log("⚠️  No accumulated transcript to respond to");
+      return;
+    }
+
+    const finalTranscript = this.accumulatedTranscript.trim();
+    console.log(
+      `📝📝📝 RESPONDING TO ACCUMULATED TRANSCRIPT (1s silence detected): "${finalTranscript}" 📝📝📝`
+    );
+
+    // 🚨 CRITICAL: Verify this is still the most recent user input
+    // Check if user spoke again after this transcript timer started
+    const timeSinceLastTranscript =
+      this.lastTranscriptTime > 0
+        ? Date.now() - this.lastTranscriptTime
+        : Infinity;
+
+    // If there's been new speech very recently (< 1 second), this accumulated transcript may be stale
+    // But if it's been 3+ seconds (our conversation window), it should be safe to respond
+    // The timer only fires after 1 second of silence, so if lastTranscriptTime is recent,
+    // it means new speech came in after the timer started but before it fired
+    if (timeSinceLastTranscript < 1000 && this.lastTranscriptTime > 0) {
+      console.log(
+        `⚠️⚠️⚠️ POTENTIALLY STALE ACCUMULATED TRANSCRIPT - User spoke ${timeSinceLastTranscript}ms ago ⚠️⚠️⚠️`
+      );
+      console.log(
+        `   New speech detected after timer started - verifying this is still the latest...`
+      );
+      // If lastProcessedUserTranscript is different and more recent, this is stale
+      if (
+        this.lastProcessedUserTranscript &&
+        this.lastProcessedUserTranscript !== finalTranscript &&
+        !finalTranscript.includes(this.lastProcessedUserTranscript)
+      ) {
+        console.log(
+          `   ⚠️  Last processed transcript is different: "${this.lastProcessedUserTranscript}"`
+        );
+        console.log(`   ⚠️  Accumulated transcript: "${finalTranscript}"`);
+        console.log(
+          `   🚫 Skipping response - accumulated transcript appears stale`
+        );
+        // Clear the stale accumulated transcript
+        this.accumulatedTranscript = "";
+        return;
+      }
+    }
+
+    // Clear accumulated transcript before processing
+    this.accumulatedTranscript = "";
+
+    // Check if we've already responded to this exact transcript
+    if (this.respondedToTranscripts.has(finalTranscript)) {
+      console.log(
+        `⚠️⚠️⚠️ SKIPPING LOOP - Already responded to accumulated transcript: "${finalTranscript}" ⚠️⚠️⚠️`
+      );
+      return;
+    }
+
+    // Don't respond if AI is currently speaking
+    if (this.isProcessingResponse) {
+      console.log(
+        `⚠️  AI is currently speaking - deferring accumulated transcript response`
+      );
+      // Restore accumulated transcript for later
+      this.accumulatedTranscript = finalTranscript;
+      return;
+    }
+
+    // Track which transcript is triggering this response
+    this.lastUserTranscriptForResponse = finalTranscript;
+    // Note: We'll mark this transcript as responded to AFTER the response is created
+    // (in response.created handler) to avoid false duplicate detection
+
+    // Store transcription for validation against AI response
+    const transcriptId = uuidv4();
+    const transcriptionTimestamp = Date.now();
+    this.pendingTranscriptionValidation.set(transcriptId, {
+      transcript: finalTranscript,
+      timestamp: transcriptionTimestamp,
+    });
+
+    console.log(
+      `🔄🔄🔄 REQUESTING AI RESPONSE TO ACCUMULATED TRANSCRIPT: "${finalTranscript}" 🔄🔄🔄`
+    );
+    console.log(`📋 Stored transcription for validation (ID: ${transcriptId})`);
+
+    // Check if user said goodbye/ending phrases
+    if (this.isUserGoodbyePhrase(finalTranscript)) {
+      console.log(
+        `🚪🚪🚪 USER SAID GOODBYE/ENDING PHRASE: "${finalTranscript}" 🚪🚪🚪`
+      );
+      console.log(
+        `   AI should respond with simple goodbye (e.g., "Thank you"), NOT reintroduce itself`
+      );
+    }
+
+    // Request AI response
+    this.requestAIResponse(finalTranscript);
+  }
+
+  /**
    * Request AI response with validation and delay
    */
   private requestAIResponse(userTranscript: string): void {
     // 🚨 CRITICAL: Don't request a response if AI just finished speaking
     // This prevents echo/feedback from triggering new responses
+    // BUT: Allow legitimate questions and longer phrases (not echo)
     const timeSinceResponseEnd =
       this.lastResponseEndTime > 0
         ? Date.now() - this.lastResponseEndTime
         : Infinity;
-    if (timeSinceResponseEnd < TIMING_THRESHOLDS.POST_RESPONSE_ECHO_MS) {
+
+    // Check if this is a legitimate question or longer phrase (not echo)
+    const isQuestion = this.containsQuestion(userTranscript);
+    const wordCount = userTranscript.trim().split(/\s+/).length;
+    const isLongPhrase = wordCount >= 5; // Phrases with 5+ words are likely legitimate
+
+    // Allow response if:
+    // 1. It's a question (legitimate user input)
+    // 2. It's a longer phrase (5+ words, likely not echo)
+    // 3. Enough time has passed (original behavior)
+    const isLegitimateInput = isQuestion || isLongPhrase;
+
+    if (
+      timeSinceResponseEnd < TIMING_THRESHOLDS.POST_RESPONSE_ECHO_MS &&
+      !isLegitimateInput
+    ) {
       console.log(
         `⚠️  Skipping response request - AI just finished speaking ${timeSinceResponseEnd}ms ago (likely echo/feedback)`
       );
+      console.log(
+        `   Transcript: "${userTranscript}" (${wordCount} words, isQuestion: ${isQuestion})`
+      );
       return;
+    }
+
+    if (
+      isLegitimateInput &&
+      timeSinceResponseEnd < TIMING_THRESHOLDS.POST_RESPONSE_ECHO_MS
+    ) {
+      console.log(
+        `✅ Allowing response to legitimate input (${timeSinceResponseEnd}ms after AI finished)`
+      );
+      console.log(
+        `   Transcript: "${userTranscript}" (${wordCount} words, isQuestion: ${isQuestion})`
+      );
     }
 
     // Check if we should skip requesting a response
@@ -992,7 +1341,55 @@ CALL ENDING - CRITICAL:
       console.log(
         "⚠️  Skipping response request - already processing or pending"
       );
-      return;
+      console.log(
+        `   State: isProcessingResponse=${this.isProcessingResponse}, hasPendingResponseRequest=${this.hasPendingResponseRequest}`
+      );
+      console.log(
+        `   Response state: hasAudio=${this.currentResponseHasAudio}, audioDone=${this.currentResponseAudioDone}`
+      );
+      console.log(
+        `   Time since last response end: ${
+          this.lastResponseEndTime > 0
+            ? Date.now() - this.lastResponseEndTime
+            : "N/A"
+        }ms`
+      );
+      console.log(
+        `   User transcript: "${userTranscript.substring(0, 100)}${
+          userTranscript.length > 100 ? "..." : ""
+        }"`
+      );
+      // 🚨 SAFETY CHECK: If these flags are stuck, clear them to allow response
+      // This is a safeguard against state corruption from errors
+      const timeSinceLastResponseEnd =
+        this.lastResponseEndTime > 0
+          ? Date.now() - this.lastResponseEndTime
+          : Infinity;
+      const isStuckState =
+        !this.currentResponseHasAudio &&
+        !this.currentResponseAudioDone &&
+        (timeSinceLastResponseEnd > 5000 || this.lastResponseEndTime === 0);
+
+      if (isStuckState) {
+        console.warn(
+          "🔧🔧🔧 STATE STUCK DETECTED - Clearing flags to allow response 🔧🔧🔧"
+        );
+        console.warn(
+          "   This may indicate a previous error left the state in an inconsistent state"
+        );
+        console.warn(
+          `   Clearing flags: isProcessingResponse=${this.isProcessingResponse} -> false, hasPendingResponseRequest=${this.hasPendingResponseRequest} -> false`
+        );
+        this.isProcessingResponse = false;
+        this.hasPendingResponseRequest = false;
+        this.clearPendingResponseRequest();
+        // Continue to request response below (don't return)
+      } else {
+        console.log(
+          "   State appears valid - response is actually in progress, skipping"
+        );
+        return;
+      }
     }
 
     // Clear any existing pending response request
@@ -1013,7 +1410,8 @@ CALL ENDING - CRITICAL:
     this.pendingResponseRequest = setTimeout(() => {
       this.pendingResponseRequest = null;
 
-      // Verify this is still the latest user speech before responding
+      // 🚨 CRITICAL: Verify this is still the latest user speech before responding
+      // This ensures we only respond to the most recent user input, not old transcripts
       const now = Date.now();
       if (
         this.latestUserSpeechTimestamp > 0 &&
@@ -1026,8 +1424,48 @@ CALL ENDING - CRITICAL:
         console.log(
           `   User spoke ${timeDiff}ms after transcription - will wait for new transcription`
         );
+        console.log(
+          `   This ensures we only respond to the MOST RECENT user input`
+        );
         this.hasPendingResponseRequest = false;
         return;
+      }
+
+      // 🚨 CRITICAL: Verify the transcript we're responding to is still valid
+      // For accumulated transcripts, they should include the last processed transcript
+      // If lastProcessedUserTranscript exists and is NOT part of userTranscript, it's likely stale
+      if (
+        this.lastProcessedUserTranscript &&
+        this.lastProcessedUserTranscript.trim() &&
+        userTranscript !== this.lastProcessedUserTranscript &&
+        !userTranscript.includes(this.lastProcessedUserTranscript)
+      ) {
+        // Check if this is a timing issue - if lastProcessedUserTranscript is very recent,
+        // the accumulated transcript might be stale
+        const timeSinceLastProcessed =
+          this.lastTranscriptTime > 0
+            ? Date.now() - this.lastTranscriptTime
+            : Infinity;
+
+        // If last processed transcript is very recent (< 1 second) and not in accumulated,
+        // this is likely a stale accumulated transcript
+        if (timeSinceLastProcessed < 1000) {
+          console.log(
+            `⚠️⚠️⚠️ POTENTIALLY STALE TRANSCRIPT - Last processed transcript not in accumulated ⚠️⚠️⚠️`
+          );
+          console.log(`   Transcript to respond to: "${userTranscript}"`);
+          console.log(
+            `   Last processed transcript: "${this.lastProcessedUserTranscript}"`
+          );
+          console.log(
+            `   Time since last processed: ${timeSinceLastProcessed}ms`
+          );
+          console.log(
+            `   This may be a stale accumulated transcript - verifying...`
+          );
+          // Don't cancel yet - let it proceed but log the warning
+          // The timestamp check above should catch truly stale transcripts
+        }
       }
 
       // Check again before requesting (race condition protection)
@@ -1101,6 +1539,8 @@ CALL ENDING - CRITICAL:
     this.isInterrupted = true; // Mark as interrupted - don't respond until user finishes
     this.suspectedSpeech = false; // Clear suspected flag
     this.latestUserSpeechTimestamp = transcriptionTime;
+    // Clear conversation window since user interrupted - start fresh
+    this.clearConversationWindow();
 
     // Cancel the response immediately - this is the ONLY place responses are cancelled
     this.cancelResponseSafely();
@@ -1359,9 +1799,63 @@ CALL ENDING - CRITICAL:
             `📅 Latest user speech timestamp: ${this.latestUserSpeechTimestamp}`
           );
 
+          // 🚨 CRITICAL: Check if we've already responded to this transcript
+          // This prevents duplicate responses when OpenAI creates a response after we've already handled it
+          // This can happen due to race conditions where response.done hasn't cleared the transcript yet
+          if (
+            respondingTo !== "(unknown - no transcript tracked)" &&
+            this.respondedToTranscripts.has(respondingTo)
+          ) {
+            console.log(
+              `🚨🚨🚨 DUPLICATE RESPONSE DETECTED - Already responded to: "${respondingTo}" 🚨🚨🚨`
+            );
+            console.log(
+              "   This is likely a race condition where OpenAI queued a response before we could clear the transcript"
+            );
+
+            // 🚨 CRITICAL FIX: Don't cancel if a response is already being processed
+            // This prevents cancelling responses that are mid-stream, even if audio hasn't started yet
+            // Audio chunks may arrive after response.created, so we need to check isProcessingResponse
+            // Cancelling at this point would interrupt audio playback that's already in progress or about to start
+            if (this.isProcessingResponse || this.currentResponseHasAudio) {
+              console.log(
+                "   ⚠️  WARNING: First response is already processing - NOT cancelling to avoid interrupting playback"
+              );
+              console.log(
+                `   Response status: isProcessing=${this.isProcessingResponse}, hasAudio=${this.currentResponseHasAudio}, audioDone=${this.currentResponseAudioDone}`
+              );
+              console.log(
+                "   This duplicate response.created is harmless - first response is already in progress"
+              );
+              // Just return without cancelling - let the first response finish naturally
+              return; // Exit early - don't process this duplicate response
+            }
+
+            console.log(
+              "   Cancelling this duplicate response to prevent AI from repeating itself"
+            );
+            if (this.realtimeConnection) {
+              this.realtimeConnection.cancelResponse();
+              // Reset flags
+              this.isProcessingResponse = false;
+              this.hasPendingResponseRequest = false;
+              this.shouldStopAudio = false;
+              // Clear the transcript to prevent future duplicates
+              if (this.lastProcessedUserTranscript === respondingTo) {
+                this.lastProcessedUserTranscript = "";
+              }
+              if (this.lastUserTranscriptForResponse === respondingTo) {
+                this.lastUserTranscriptForResponse = "";
+              }
+              return; // Exit early - don't process this duplicate response
+            }
+          }
+
           // 🚨 WARNING: If there's no valid user input, this might be an auto-generated response
           // This can happen when OpenAI's Realtime API detects audio or generates a response automatically
           // OR when transcription fails (e.g., due to rate limiting)
+          // BUT: If we have a transcript (even if timestamp wasn't set due to echo suppression),
+          // we should allow the response to proceed
           if (
             this.latestUserSpeechTimestamp === 0 &&
             !this.lastUserTranscriptForResponse &&
@@ -1373,12 +1867,17 @@ CALL ENDING - CRITICAL:
             console.log(
               "   This is likely caused by a failed transcription (rate limiting) or echo detection"
             );
-            
+
             // 🚨 CRITICAL: Cancel this response immediately - we have no user input to respond to
             // This commonly happens when transcription fails due to rate limiting (429 errors)
+            // BUT: Only cancel if we haven't sent the greeting yet (allow initial greeting)
             if (this.realtimeConnection && !this.hasSentGreeting) {
-              console.log("🛑 CANCELLING INVALID RESPONSE - No valid user input detected");
-              console.log("   This prevents the AI from speaking without knowing what the user said");
+              console.log(
+                "🛑 CANCELLING INVALID RESPONSE - No valid user input detected"
+              );
+              console.log(
+                "   This prevents the AI from speaking without knowing what the user said"
+              );
               this.realtimeConnection.cancelResponse();
               // Reset flags
               this.isProcessingResponse = false;
@@ -1391,6 +1890,13 @@ CALL ENDING - CRITICAL:
               );
               console.log(
                 "   Response will be checked for duplicate introductions before being saved"
+              );
+            } else {
+              // After greeting is sent, if we have no transcript but response was created,
+              // it might be a legitimate response that was triggered by audio detection
+              // Allow it to proceed but log a warning
+              console.log(
+                "   ⚠️  Response created without tracked transcript, but allowing to proceed (might be legitimate audio-triggered response)"
               );
             }
           }
@@ -1409,6 +1915,8 @@ CALL ENDING - CRITICAL:
           this.isProcessingResponse = true;
           this.hasPendingResponseRequest = false; // Clear pending flag since we now have an active response
           this.responseStartTime = Date.now(); // Track when response started
+          this.currentResponseHasAudio = false; // Reset audio flag for new response
+          this.currentResponseAudioDone = false; // Reset audio done flag for new response
           // Reset stop audio flag - new response is starting, allow audio to flow
           this.shouldStopAudio = false;
           // Safety: Clear interruption flag when new response starts (should already be cleared, but be safe)
@@ -1418,6 +1926,19 @@ CALL ENDING - CRITICAL:
             );
             this.isInterrupted = false;
           }
+
+          // 🚨 CRITICAL: Mark transcript as responded to NOW (after passing duplicate check)
+          // This prevents future duplicate responses to the same transcript
+          if (
+            respondingTo !== "(unknown - no transcript tracked)" &&
+            !this.respondedToTranscripts.has(respondingTo)
+          ) {
+            this.respondedToTranscripts.add(respondingTo);
+            console.log(
+              `✅ Marked transcript as responded to: "${respondingTo}"`
+            );
+          }
+
           console.log(`⏱️  AI response start time: ${this.responseStartTime}`);
           break;
 
@@ -1503,13 +2024,44 @@ CALL ENDING - CRITICAL:
               break; // Don't save duplicate
             }
 
+            // 🚨 PREVENT INTRODUCTIONS AFTER USER GOODBYE:
+            // If the user (representative) said goodbye/ending phrases, the AI should NOT reintroduce itself
+            const userSaidGoodbye = this.lastUserTranscriptForResponse
+              ? this.isUserGoodbyePhrase(this.lastUserTranscriptForResponse)
+              : false;
+            if (
+              isIntroduction &&
+              this.hasGivenIntroduction &&
+              userSaidGoodbye
+            ) {
+              console.log(
+                `⚠️⚠️⚠️ DUPLICATE INTRODUCTION DETECTED (user said goodbye) ⚠️⚠️⚠️`
+              );
+              console.log(
+                `   User transcript: "${this.lastUserTranscriptForResponse}"`
+              );
+              console.log(`   New response: "${transcriptText}"`);
+              console.log(
+                `   User said goodbye - AI should NOT reintroduce itself, skipping duplicate introduction`
+              );
+              break; // Don't save duplicate
+            }
+
             if (isIntroduction) {
               this.hasGivenIntroduction = true;
             }
 
             // Check if AI has closed the call (said goodbye/thank you)
-            // BUT: Don't close if the AI just asked a question - it's expecting a response
+            // 🚨 CRITICAL: Only mark as closed if user explicitly said goodbye/ending phrases OR goal is achieved
             if (this.isClosingPhrase(transcriptText)) {
+              // 🚨 CRITICAL: Validate that user actually signaled the end before AI said goodbye
+              const userSaidGoodbye = this.lastUserTranscriptForResponse
+                ? this.isUserGoodbyePhrase(this.lastUserTranscriptForResponse)
+                : false;
+
+              // Check if goal is achieved (this would require tracking goal completion, which is complex)
+              // For now, we'll be strict: only close if user explicitly said goodbye
+
               // If the current response contains a question, don't close the call
               // The AI is asking for something and expecting a response
               const currentResponseHasQuestion =
@@ -1521,7 +2073,26 @@ CALL ENDING - CRITICAL:
                 this.lastAIResponse &&
                 this.containsQuestion(this.lastAIResponse);
 
-              if (currentResponseHasQuestion || previousResponseHasQuestion) {
+              // 🚨 CRITICAL: Only close if user explicitly said goodbye/ending phrases
+              if (!userSaidGoodbye) {
+                console.log(
+                  "⚠️⚠️⚠️ AI SAID GOODBYE BUT USER DIDN'T SIGNAL END - NOT CLOSING CALL ⚠️⚠️⚠️"
+                );
+                console.log(`   AI said: "${transcriptText}"`);
+                console.log(
+                  `   User said: "${
+                    this.lastUserTranscriptForResponse || "nothing"
+                  }"`
+                );
+                console.log(
+                  `   User did NOT say explicit goodbye/ending phrases - AI should NOT have said goodbye`
+                );
+                console.log(`   This is likely a mistake - call will continue`);
+                // Don't mark as closed - the AI shouldn't have said goodbye
+              } else if (
+                currentResponseHasQuestion ||
+                previousResponseHasQuestion
+              ) {
                 console.log(
                   "⚠️ AI said goodbye but also asked a question - NOT closing call (expecting response)"
                 );
@@ -1536,8 +2107,14 @@ CALL ENDING - CRITICAL:
                   );
                 }
               } else {
+                // User explicitly said goodbye AND AI didn't ask a question - valid closing
                 this.hasClosedCall = true;
-                console.log("🚪 Call marked as closed - AI said goodbye");
+                console.log(
+                  "🚪 Call marked as closed - AI said goodbye (user explicitly signaled end)"
+                );
+                console.log(
+                  `   User said: "${this.lastUserTranscriptForResponse}"`
+                );
               }
             }
 
@@ -1553,6 +2130,39 @@ CALL ENDING - CRITICAL:
             // Update last response
             this.lastAIResponse = transcriptText;
             await this.saveTranscript("ai", transcriptText);
+
+            // 🚨 CRITICAL: If AI just asked a question, clear accumulated transcript
+            // The old accumulated transcript was already addressed - we need to wait for NEW user input
+            const aiJustAskedQuestion = this.containsQuestion(transcriptText);
+            if (aiJustAskedQuestion) {
+              console.log(
+                `❓ AI just asked a question - clearing accumulated transcript to wait for NEW user response`
+              );
+              console.log(
+                `   Question: "${transcriptText.substring(0, 100)}${
+                  transcriptText.length > 100 ? "..." : ""
+                }"`
+              );
+
+              // Clear accumulated transcript (old user input already addressed)
+              if (this.accumulatedTranscript.trim()) {
+                console.log(
+                  `   Old accumulated transcript (being cleared): "${this.accumulatedTranscript}"`
+                );
+              }
+              this.accumulatedTranscript = "";
+              this.lastTranscriptTime = 0;
+
+              // Clear conversation window timer (don't respond to old transcript)
+              this.clearConversationWindowTimer();
+
+              // Clear last processed transcript (don't respond to old input)
+              this.lastProcessedUserTranscript = "";
+
+              console.log(
+                `   ✅ Cleared accumulated transcript and timers - waiting for NEW user input in response to question`
+              );
+            }
           }
           break;
 
@@ -1569,12 +2179,14 @@ CALL ENDING - CRITICAL:
 
           const audioBase64 = message.delta || "";
           if (audioBase64) {
+            this.currentResponseHasAudio = true; // Mark that this response has audio
             await this.handleRealtimeAudio(audioBase64);
           }
           break;
 
         case "response.audio.done":
           console.log("✅ AI audio response complete");
+          this.currentResponseAudioDone = true; // Mark that audio generation is complete for current response
           // Don't set isProcessingResponse to false here - wait for response.done
           break;
 
@@ -1585,12 +2197,70 @@ CALL ENDING - CRITICAL:
           // Reset the stop audio flag when response is done
           this.shouldStopAudio = false;
           // Track when response ended for echo suppression
-          this.lastResponseEndTime = Date.now();
+          // 🚨 CRITICAL: Only set lastResponseEndTime if audio was actually generated
+          // Cancelled responses that never produced audio should NOT trigger echo suppression
+          if (this.currentResponseHasAudio) {
+            this.lastResponseEndTime = Date.now();
+            console.log("   ✅ Response had audio - echo suppression active");
+          } else {
+            console.log(
+              "   ⚠️  Response had no audio (cancelled before audio generation) - NOT triggering echo suppression"
+            );
+          }
+          // Reset audio tracking flags for next response
+          this.currentResponseHasAudio = false;
+          this.currentResponseAudioDone = false;
 
-          // 🚨 CRITICAL: After AI finishes speaking, check if there's a pending user transcript to respond to
+          // 🚨 CRITICAL: After AI finishes speaking, check if there's accumulated user speech to respond to
           // If user spoke while AI was talking (and it wasn't an interruption), now we can respond
           // Note: hasClosedCall no longer prevents responses - AI can say goodbye but call continues
+
+          // 🚨 SOLUTION 2: If we have accumulated transcript, start the conversation window timer
+          // BUT: Only if AI didn't just ask a question (questions need NEW user input, not old accumulated transcript)
+          const aiJustAskedQuestion =
+            this.lastAIResponse && this.containsQuestion(this.lastAIResponse);
+
+          if (this.accumulatedTranscript.trim() && !aiJustAskedQuestion) {
+            console.log(
+              `📝 AI finished speaking - starting 1-second timer for accumulated transcript: "${this.accumulatedTranscript}"`
+            );
+            // Clear any existing timer
+            this.clearConversationWindowTimer();
+            // Start the 1-second timer
+            this.conversationWindowTimer = setTimeout(() => {
+              this.conversationWindowTimer = null;
+              console.log(
+                `⏱️  1 second of silence detected after AI finished - processing accumulated transcript`
+              );
+              this.handleAccumulatedTranscriptResponse();
+            }, TIMING_THRESHOLDS.CONVERSATION_WINDOW_MS);
+            break; // Exit early - don't use old logic
+          } else if (this.accumulatedTranscript.trim() && aiJustAskedQuestion) {
+            console.log(
+              `❓ AI just asked a question - NOT responding to old accumulated transcript`
+            );
+            console.log(
+              `   Old accumulated transcript (ignored): "${this.accumulatedTranscript}"`
+            );
+            console.log(
+              `   AI's question: "${this.lastAIResponse?.substring(0, 100)}${
+                this.lastAIResponse && this.lastAIResponse.length > 100
+                  ? "..."
+                  : ""
+              }"`
+            );
+            console.log(
+              `   ✅ Waiting for NEW user input in response to the question`
+            );
+            // Clear the old accumulated transcript since AI asked a question
+            this.accumulatedTranscript = "";
+            this.lastTranscriptTime = 0;
+            break; // Exit early - don't process old transcript
+          }
+
+          // Fallback to old behavior if no accumulated transcript (for backward compatibility)
           if (this.lastProcessedUserTranscript) {
+            // Fallback to old behavior if no accumulated transcript (for backward compatibility)
             const pendingTranscript = this.lastProcessedUserTranscript;
             const timeSinceResponseEnd = Date.now() - this.lastResponseEndTime;
 
@@ -1653,8 +2323,8 @@ CALL ENDING - CRITICAL:
                 console.log(
                   `🔄 AI finished speaking - now responding to pending user transcript: "${pendingTranscript}"`
                 );
-                // Mark this transcript as responded to BEFORE requesting response (prevent race conditions)
-                this.respondedToTranscripts.add(pendingTranscript);
+                // Note: We'll mark this transcript as responded to AFTER the response is created
+                // (in response.created handler) to avoid false duplicate detection
                 this.lastUserTranscriptForResponse = pendingTranscript;
                 this.requestAIResponse(pendingTranscript);
                 // Clear lastProcessedUserTranscript after responding to prevent loops
@@ -1698,6 +2368,9 @@ CALL ENDING - CRITICAL:
           this.hasPendingResponseRequest = false;
           // Reset the stop audio flag when response is cancelled
           this.shouldStopAudio = false;
+          // Reset audio tracking flags
+          this.currentResponseHasAudio = false;
+          this.currentResponseAudioDone = false;
           break;
 
         case "conversation.item.created":
@@ -1707,17 +2380,24 @@ CALL ENDING - CRITICAL:
         case "conversation.item.input_audio_transcription.failed":
           // Transcription failed - log the error and investigate
           console.error("❌ ❌ ❌ INPUT AUDIO TRANSCRIPTION FAILED ❌ ❌ ❌");
-          
+
           // Check if this is a rate limiting error (429)
-          const isRateLimitError = message.error?.message?.includes("429") || 
-                                  message.error?.message?.includes("Too Many Requests");
-          
+          const isRateLimitError =
+            message.error?.message?.includes("429") ||
+            message.error?.message?.includes("Too Many Requests");
+
           if (isRateLimitError) {
-            console.error("🚨🚨🚨 RATE LIMIT ERROR (429 Too Many Requests) 🚨🚨🚨");
+            console.error(
+              "🚨🚨🚨 RATE LIMIT ERROR (429 Too Many Requests) 🚨🚨🚨"
+            );
             console.error("   Your OpenAI API key has hit rate limits!");
             console.error("   Possible solutions:");
-            console.error("   1. Wait a few minutes for the rate limit to reset");
-            console.error("   2. Upgrade your OpenAI API plan for higher limits");
+            console.error(
+              "   1. Wait a few minutes for the rate limit to reset"
+            );
+            console.error(
+              "   2. Upgrade your OpenAI API plan for higher limits"
+            );
             console.error("   3. Check your OpenAI dashboard for usage/quotas");
             console.error("   4. Reduce the number of concurrent calls");
           } else {
@@ -1728,7 +2408,7 @@ CALL ENDING - CRITICAL:
             console.error("   3. Audio duration is too short");
             console.error("   4. Network issues");
           }
-          
+
           console.error(
             "   Message details:",
             JSON.stringify(message, null, 2)
@@ -1741,24 +2421,28 @@ CALL ENDING - CRITICAL:
               JSON.stringify(message.error, null, 2)
             );
           }
-          
+
           // 🚨 CRITICAL: Clear state to prevent AI from responding without valid input
           console.log("🔧 Clearing state flags to prevent empty response...");
           this.suspectedSpeech = false;
           this.clearPendingResponseRequest();
-          
+
           // 🚨 CRITICAL: Cancel any active response that might have been triggered
           // This prevents the AI from speaking without knowing what the user said
           if (this.isProcessingResponse && this.realtimeConnection) {
-            console.log("🛑 Cancelling AI response - no valid transcription available");
+            console.log(
+              "🛑 Cancelling AI response - no valid transcription available"
+            );
             this.realtimeConnection.cancelResponse();
           }
-          
+
           // Reset the processed transcript tracking to prevent responses
           // If this transcription failed, we should NOT respond to it
           this.lastUserTranscriptForResponse = "";
-          
-          console.log("✅ State cleared - AI will not respond without valid transcription");
+
+          console.log(
+            "✅ State cleared - AI will not respond without valid transcription"
+          );
           break;
 
         case "conversation.item.input_audio_transcription.completed":
@@ -1786,6 +2470,57 @@ CALL ENDING - CRITICAL:
               `⚠️⚠️⚠️ IGNORING TRANSCRIPTION (too short): "${userTranscript}" ⚠️⚠️⚠️`
             );
             break;
+          }
+
+          // 🚨 TRANSCRIPTION QUALITY VALIDATION: Check for completely nonsensical transcriptions
+          // These often indicate poor audio quality, echo, or encoding issues
+          const transcriptionQuality =
+            this.assessTranscriptionQuality(userTranscript);
+          if (!transcriptionQuality.isValid) {
+            console.error(
+              `🚨🚨🚨 REJECTING TRANSCRIPTION - POOR QUALITY DETECTED 🚨🚨🚨`
+            );
+            console.error(`   Transcription: "${userTranscript}"`);
+            console.error(
+              `   Quality Score: ${(transcriptionQuality.score * 100).toFixed(
+                1
+              )}%`
+            );
+            console.error(
+              `   Issues: ${transcriptionQuality.issues.join(", ")}`
+            );
+            console.error(`   💡 This transcription appears to be:`);
+            if (transcriptionQuality.isNonsensical) {
+              console.error(
+                `      - Completely nonsensical (random words/phrases)`
+              );
+            }
+            if (transcriptionQuality.hasUnusualPatterns) {
+              console.error(`      - Contains unusual/unlikely word patterns`);
+            }
+            console.error(`   🔧 LIKELY CAUSES:`);
+            console.error(`      - Poor audio quality or encoding issues`);
+            console.error(`      - Echo/feedback in audio stream`);
+            console.error(
+              `      - Audio sample rate conversion artifacts (8kHz → 16kHz → 24kHz)`
+            );
+            console.error(`      - Background noise or interference`);
+            console.error(
+              `   📝 This transcription will be REJECTED to prevent AI from responding incorrectly`
+            );
+            break; // Don't process this transcription
+          } else if (transcriptionQuality.score < 0.7) {
+            console.warn(
+              `⚠️  Low-quality transcription detected (score: ${(
+                transcriptionQuality.score * 100
+              ).toFixed(1)}%): "${userTranscript}"`
+            );
+            console.warn(
+              `   Issues: ${transcriptionQuality.issues.join(", ")}`
+            );
+            console.warn(
+              `   ⚠️  Proceeding with caution - AI response will be validated`
+            );
           }
 
           // 🚨 FILTER VOICEMAIL/SYSTEM MESSAGES: Reject transcriptions that look like voicemail greetings or system messages
@@ -1884,59 +2619,223 @@ CALL ENDING - CRITICAL:
             // VAD didn't confirm it - check if it's echo
             // Apply echo suppression checks
 
-            // 🚨 IMPORTANT: Allow greeting phrases through even if they happen shortly after AI starts
-            // Customer service representatives often greet callers right after the call connects,
-            // and this should NOT be considered echo
+            // 🚨 CRITICAL: During AI speech, ONLY interruption phrases are allowed
+            // Anything else (including greetings) is treated as echo to prevent false positives
             const isGreeting = this.isGreetingPhrase(userTranscript);
 
+            // 🚨 STRICT ECHO DETECTION: During AI speech, treat ANY transcription as echo UNLESS it's an interruption phrase
+            // This includes greetings, regular speech, and any other phrases - ONLY clear interruption signals are allowed
             if (
               timeSinceAIResponseStart < TIMING_THRESHOLDS.ECHO_PERIOD_MS &&
-              !isGreeting
+              !isInterruptionPhrase
             ) {
+              // During early AI speech, reject ALL transcriptions unless they're interruption phrases
+              // This prevents echo from being accepted as real user speech
               console.log(
-                `⚠️⚠️⚠️ LIKELY ECHO (AI just started ${timeSinceAIResponseStart}ms ago): "${userTranscript}" ⚠️⚠️⚠️`
+                `⚠️⚠️⚠️ LIKELY ECHO (AI just started ${timeSinceAIResponseStart}ms ago, no interruption phrase): "${userTranscript}" ⚠️⚠️⚠️`
               );
+              console.log(
+                `   All speech during AI response (without clear interruption signals like 'wait', 'wait a sec') is treated as echo`
+              );
+              if (isGreeting) {
+                console.log(
+                  `   Even greeting phrases are treated as echo during AI speech - only clear interruption signals are allowed`
+                );
+              }
               console.log(
                 `   This transcription will NOT be saved (likely AI echo)`
               );
               isLikelyEcho = true;
-            } else if (
-              isGreeting &&
-              timeSinceAIResponseStart < TIMING_THRESHOLDS.ECHO_PERIOD_MS
-            ) {
-              console.log(
-                `✅ Accepting greeting phrase (AI started ${timeSinceAIResponseStart}ms ago): "${userTranscript}"`
-              );
-              console.log(
-                `   Greeting phrases are allowed even if they happen shortly after AI starts`
-              );
             }
 
             // Also check if AI is currently processing a response
-            // But allow greeting phrases through (representatives may greet during AI speech)
+            // 🚨 CRITICAL: During AI speech, ONLY interruption phrases are allowed - everything else is echo
+            // 🚨 STRICT ECHO DETECTION: During AI speech, treat ANY transcription as echo UNLESS it's an interruption phrase
             if (
               !isLikelyEcho &&
               this.isProcessingResponse &&
               timeSinceAIResponseStart <
                 TIMING_THRESHOLDS.ECHO_SUPPRESSION_MS &&
-              !isGreeting
+              !isInterruptionPhrase
             ) {
+              // During AI speech, reject ALL transcriptions unless they're interruption phrases
+              // This prevents echo from being accepted as real user speech
+              // Only clear interruption signals like 'wait', 'wait a sec', 'stop' are allowed
               console.log(
-                `⚠️⚠️⚠️ LIKELY ECHO (AI is speaking, ${timeSinceAIResponseStart}ms since start): "${userTranscript}" ⚠️⚠️⚠️`
+                `⚠️⚠️⚠️ LIKELY ECHO (AI is speaking, ${timeSinceAIResponseStart}ms since start, no interruption phrase): "${userTranscript}" ⚠️⚠️⚠️`
               );
+              console.log(
+                `   All speech during AI response (without clear interruption signals like 'wait', 'wait a sec') is treated as echo`
+              );
+              if (this.lastAIResponse) {
+                console.log(`   AI is saying: "${this.lastAIResponse}"`);
+              }
+              if (isGreeting) {
+                console.log(
+                  `   Even greeting phrases are treated as echo during AI speech - only clear interruption signals are allowed`
+                );
+              }
               console.log(
                 `   This transcription will NOT be saved (likely AI echo)`
               );
               isLikelyEcho = true;
             } else if (
-              isGreeting &&
+              !isLikelyEcho &&
               this.isProcessingResponse &&
-              timeSinceAIResponseStart < TIMING_THRESHOLDS.ECHO_SUPPRESSION_MS
+              timeSinceAIResponseStart <
+                TIMING_THRESHOLDS.ECHO_SUPPRESSION_EXTENDED_MS &&
+              !isInterruptionPhrase
             ) {
-              console.log(
-                `✅ Accepting greeting phrase during AI speech (${timeSinceAIResponseStart}ms since start): "${userTranscript}"`
-              );
+              // Extended echo suppression period - still reject unless interruption phrase
+              // Only clear interruption signals like 'wait', 'wait a sec', 'stop' are allowed
+              // Check for garbled echo (contains words from AI's speech)
+              if (this.lastAIResponse) {
+                const aiWords = this.lastAIResponse.toLowerCase().split(/\s+/);
+                const transcriptWords = userTranscript
+                  .toLowerCase()
+                  .split(/\s+/);
+                const commonWords = aiWords.filter(
+                  (word) =>
+                    word.length > 3 && // Only check meaningful words (length > 3)
+                    transcriptWords.includes(word)
+                );
+
+                // If transcription contains multiple words from AI's speech, it's likely garbled echo
+                const isGarbledEcho =
+                  commonWords.length >= 2 ||
+                  (commonWords.length >= 1 &&
+                    userTranscript.trim().split(/\s+/).length <= 5);
+
+                if (isGarbledEcho) {
+                  console.log(
+                    `⚠️⚠️⚠️ LIKELY GARBLED ECHO (contains ${commonWords.length} words from AI's speech during AI speech): "${userTranscript}" ⚠️⚠️⚠️`
+                  );
+                  console.log(`   AI is saying: "${this.lastAIResponse}"`);
+                  console.log(
+                    `   Common words found: ${commonWords.join(", ")}`
+                  );
+                  console.log(
+                    `   This transcription will NOT be saved (likely garbled AI echo)`
+                  );
+                  isLikelyEcho = true;
+                } else {
+                  // Still reject during extended echo suppression unless it's an interruption phrase
+                  console.log(
+                    `⚠️⚠️⚠️ LIKELY ECHO (AI recently finished, ${timeSinceAIResponseStart}ms since start, no interruption phrase): "${userTranscript}" ⚠️⚠️⚠️`
+                  );
+                  console.log(
+                    `   All speech during extended echo suppression period (without clear interruption signals) is treated as echo`
+                  );
+                  console.log(
+                    `   This transcription will NOT be saved (likely AI echo)`
+                  );
+                  isLikelyEcho = true;
+                }
+              } else {
+                // No AI response to compare yet - reject conservatively
+                console.log(
+                  `⚠️⚠️⚠️ LIKELY ECHO (AI recently finished, ${timeSinceAIResponseStart}ms since start, no interruption phrase): "${userTranscript}" ⚠️⚠️⚠️`
+                );
+                console.log(
+                  `   This transcription will NOT be saved (likely AI echo)`
+                );
+                isLikelyEcho = true;
+              }
+            } else if (
+              !isLikelyEcho &&
+              this.isProcessingResponse &&
+              timeSinceAIResponseStart >=
+                TIMING_THRESHOLDS.ECHO_SUPPRESSION_EXTENDED_MS &&
+              !isGreeting
+            ) {
+              // Later in response but still processing - check for garbled echo
+              if (this.lastAIResponse) {
+                const aiWords = this.lastAIResponse.toLowerCase().split(/\s+/);
+                const transcriptWords = userTranscript
+                  .toLowerCase()
+                  .split(/\s+/);
+                const commonWords = aiWords.filter(
+                  (word) =>
+                    word.length > 3 && // Only check meaningful words (length > 3)
+                    transcriptWords.includes(word)
+                );
+
+                // If transcription contains multiple words from AI's speech, it's likely garbled echo
+                const isGarbledEcho =
+                  commonWords.length >= 2 ||
+                  (commonWords.length >= 1 &&
+                    userTranscript.trim().split(/\s+/).length <= 5);
+
+                if (isGarbledEcho && this.isProcessingResponse) {
+                  console.log(
+                    `⚠️⚠️⚠️ LIKELY GARBLED ECHO (contains ${commonWords.length} words from AI's speech during AI speech): "${userTranscript}" ⚠️⚠️⚠️`
+                  );
+                  console.log(`   AI is saying: "${this.lastAIResponse}"`);
+                  console.log(
+                    `   Common words found: ${commonWords.join(", ")}`
+                  );
+                  console.log(
+                    `   This transcription will NOT be saved (likely garbled AI echo)`
+                  );
+                  isLikelyEcho = true;
+                } else {
+                  // Later in response but no AI text to compare yet
+                  // Still check if it's a nonsensical phrase or goodbye phrase that might be garbled echo
+                  const isGoodbyePhrase =
+                    this.isUserGoodbyePhrase(userTranscript) ||
+                    userTranscript.toLowerCase().includes("bye") ||
+                    userTranscript.toLowerCase().includes("goodbye") ||
+                    userTranscript.toLowerCase().includes("have a good") ||
+                    userTranscript.toLowerCase().includes("have a great");
+
+                  if (
+                    (this.isNonsensicalPhrase(userTranscript) ||
+                      isGoodbyePhrase) &&
+                    this.isProcessingResponse
+                  ) {
+                    const reason = this.isNonsensicalPhrase(userTranscript)
+                      ? "nonsensical phrase"
+                      : "goodbye phrase";
+                    console.log(
+                      `⚠️⚠️⚠️ LIKELY ECHO (${reason} during AI speech, ${timeSinceAIResponseStart}ms since start, no AI text yet): "${userTranscript}" ⚠️⚠️⚠️`
+                    );
+                    console.log(
+                      `   ${
+                        reason === "goodbye phrase"
+                          ? "Goodbye phrases"
+                          : "Nonsensical phrases"
+                      } during AI speech are almost always echo/feedback - rejecting`
+                    );
+                    console.log(
+                      `   This transcription will NOT be saved (likely AI echo)`
+                    );
+                    isLikelyEcho = true;
+                  } else if (
+                    this.isProcessingResponse &&
+                    !isInterruptionPhrase
+                  ) {
+                    // AI is still processing - treat any non-interruption phrase as echo
+                    // Only clear interruption signals like 'wait', 'wait a sec', 'stop' are allowed during AI speech
+                    console.log(
+                      `⚠️⚠️⚠️ LIKELY ECHO (AI is still speaking, ${timeSinceAIResponseStart}ms since start, no interruption phrase): "${userTranscript}" ⚠️⚠️⚠️`
+                    );
+                    console.log(
+                      `   All speech during AI response (without clear interruption signals) is treated as echo`
+                    );
+                    console.log(
+                      `   This transcription will NOT be saved (likely AI echo)`
+                    );
+                    isLikelyEcho = true;
+                  } else {
+                    // Accept it only if AI is not processing or it's an interruption phrase
+                    console.log(
+                      `✅ Accepting transcription (${timeSinceAIResponseStart}ms since AI started, AI not processing or interruption phrase): "${userTranscript}"`
+                    );
+                  }
+                }
+              }
             }
+            // Note: Greeting phrases during AI speech are now treated as echo - only interruption phrases are allowed
 
             // 🚨 CRITICAL: Reject short transcriptions during AI speech (likely false positives/mis-transcribed echo)
             // Even if not similar to AI's response, short phrases during AI speech are likely echo that got transcribed incorrectly
@@ -1955,24 +2854,130 @@ CALL ENDING - CRITICAL:
               isLikelyEcho = true;
             }
 
-            // 🚨 SMART ECHO DETECTION: Only reject if BOTH conditions are true:
-            // 1. Happened shortly after AI finished (within echo period)
-            // 2. AND it's similar to what AI said (actual echo)
-            // This prevents rejecting legitimate user responses that happen quickly after AI finishes
+            // 🚨 CRITICAL: Reject nonsensical/garbled phrases during AI speech (likely mis-transcribed echo)
+            // Examples: "any of us needing help" (garbled version of AI's "need help")
+            if (
+              !isLikelyEcho &&
+              this.isProcessingResponse &&
+              this.isNonsensicalPhrase(userTranscript)
+            ) {
+              console.log(
+                `⚠️⚠️⚠️ LIKELY GARBLED ECHO (nonsensical phrase during AI speech, ${timeSinceAIResponseStart}ms since start): "${userTranscript}" ⚠️⚠️⚠️`
+              );
+              console.log(
+                `   This phrase is grammatically odd/nonsensical and appeared during AI speech - likely garbled echo`
+              );
+              console.log(
+                `   This transcription will NOT be saved (likely garbled AI echo)`
+              );
+              isLikelyEcho = true;
+            }
+
+            // 🚨 SMART ECHO DETECTION: Check multiple factors to detect echo
+            // 1. Similarity to AI's response
+            // 2. Short phrases that appear very soon after AI finishes (likely mis-transcribed echo)
+            // 3. Goodbye/polite phrases that appear very soon after (likely echo)
+            // 4. Name introductions that appear soon after AI finishes (likely mis-transcribed echo)
             if (!isLikelyEcho && this.lastAIResponse) {
               const similarity = this.calculateSimilarity(
                 userTranscript.toLowerCase(),
                 this.lastAIResponse.toLowerCase()
               );
 
-              // Only reject if it's BOTH: similar to AI's response AND happened very soon after
-              // This catches actual echo while allowing quick user responses
+              const isShortPhrase =
+                userTranscript.trim().split(/\s+/).length <= 2;
+              const lowerTranscript = userTranscript.toLowerCase();
+              const isGoodbyePhrase =
+                this.isUserGoodbyePhrase(userTranscript) ||
+                lowerTranscript.includes("bye") ||
+                lowerTranscript.includes("goodbye");
+              // Check for "thank you" + "bye" combinations (common echo pattern)
+              const hasThankYouAndBye =
+                (lowerTranscript.includes("thank you") ||
+                  lowerTranscript.includes("thanks")) &&
+                (lowerTranscript.includes("bye") ||
+                  lowerTranscript.includes("goodbye"));
+              const isPolitePhrase = this.isCommonPolitePhrase(userTranscript);
+              const isNameIntroduction =
+                this.isNameIntroduction(userTranscript);
+              const isVerySoonAfter = transcriptionTimeSinceResponseEnd < 1000; // Less than 1 second
+              const isWithinEchoWindow =
+                transcriptionTimeSinceResponseEnd <
+                TIMING_THRESHOLDS.POST_RESPONSE_ECHO_MS;
+
+              // 🚨 CRITICAL: Reject short phrases, goodbye phrases, or name introductions that appear very soon after AI finishes
+              // These are almost certainly mis-transcribed echo, even if similarity is low
+              // Echo can get mis-transcribed as different words (e.g., "Thank you" → "Bye-bye", or AI speech → "My name is Kate")
               if (
-                similarity > 0.6 && // Higher threshold - must be very similar
+                isVerySoonAfter &&
+                (isShortPhrase ||
+                  isGoodbyePhrase ||
+                  isPolitePhrase ||
+                  isNameIntroduction) &&
+                !isInterruptionPhrase
+              ) {
+                console.log(
+                  `⚠️⚠️⚠️ LIKELY ECHO (${transcriptionTimeSinceResponseEnd}ms after AI finished, ${
+                    isShortPhrase
+                      ? "short phrase"
+                      : isGoodbyePhrase
+                      ? "goodbye phrase"
+                      : isPolitePhrase
+                      ? "polite phrase"
+                      : "name introduction"
+                  }): "${userTranscript}" ⚠️⚠️⚠️`
+                );
+                console.log(`   AI said: "${this.lastAIResponse}"`);
+                console.log(
+                  `   Short/goodbye/polite/name introduction phrases appearing < 1s after AI finishes are likely mis-transcribed echo`
+                );
+                console.log(
+                  `   This transcription will NOT be saved (likely AI echo)`
+                );
+                isLikelyEcho = true;
+              } else if (
+                // 🚨 CRITICAL FIX: Reject "thank you + bye" combinations within echo window
+                // These are almost always echo, even if they're 3+ words
+                hasThankYouAndBye &&
+                isWithinEchoWindow &&
+                !isInterruptionPhrase
+              ) {
+                console.log(
+                  `⚠️⚠️⚠️ LIKELY ECHO (${transcriptionTimeSinceResponseEnd}ms after AI finished, "thank you + bye" combination): "${userTranscript}" ⚠️⚠️⚠️`
+                );
+                console.log(`   AI said: "${this.lastAIResponse}"`);
+                console.log(
+                  `   Phrases containing both "thank you" and "bye" within ${TIMING_THRESHOLDS.POST_RESPONSE_ECHO_MS}ms after AI finishes are almost always echo`
+                );
+                console.log(
+                  `   This transcription will NOT be saved (likely AI echo)`
+                );
+                isLikelyEcho = true;
+              } else if (
+                // 🚨 CRITICAL FIX: Also reject goodbye phrases within the full echo window (not just 1 second)
+                isGoodbyePhrase &&
+                isWithinEchoWindow &&
+                userTranscript.trim().split(/\s+/).length <= 4 && // Allow longer phrases if they're clearly not echo
+                !isInterruptionPhrase
+              ) {
+                console.log(
+                  `⚠️⚠️⚠️ LIKELY ECHO (${transcriptionTimeSinceResponseEnd}ms after AI finished, goodbye phrase within echo window): "${userTranscript}" ⚠️⚠️⚠️`
+                );
+                console.log(`   AI said: "${this.lastAIResponse}"`);
+                console.log(
+                  `   Goodbye phrases appearing within ${TIMING_THRESHOLDS.POST_RESPONSE_ECHO_MS}ms after AI finishes are likely echo`
+                );
+                console.log(
+                  `   This transcription will NOT be saved (likely AI echo)`
+                );
+                isLikelyEcho = true;
+              } else if (
+                similarity > 0.3 && // Lower threshold - catch more echo (was 0.6, now 0.3)
                 transcriptionTimeSinceResponseEnd <
                   TIMING_THRESHOLDS.POST_RESPONSE_ECHO_MS &&
                 !isInterruptionPhrase
               ) {
+                // Also reject if it's similar to AI's response AND happened very soon after
                 console.log(
                   `⚠️⚠️⚠️ LIKELY ECHO (${(similarity * 100).toFixed(
                     0
@@ -1984,10 +2989,30 @@ CALL ENDING - CRITICAL:
                 );
                 isLikelyEcho = true;
               } else if (
+                isNameIntroduction &&
+                isWithinEchoWindow &&
+                !isInterruptionPhrase
+              ) {
+                // 🚨 CRITICAL: Reject name introductions within echo window
+                // Name introductions like "My name is Kate" are often mis-transcribed echo
+                // when they appear within POST_RESPONSE_ECHO_MS after AI finishes speaking
+                console.log(
+                  `⚠️⚠️⚠️ LIKELY ECHO (name introduction ${transcriptionTimeSinceResponseEnd}ms after AI finished): "${userTranscript}" ⚠️⚠️⚠️`
+                );
+                console.log(`   AI said: "${this.lastAIResponse}"`);
+                console.log(
+                  `   Name introductions appearing within ${TIMING_THRESHOLDS.POST_RESPONSE_ECHO_MS}ms after AI finishes are likely mis-transcribed echo`
+                );
+                console.log(
+                  `   This transcription will NOT be saved (likely AI echo)`
+                );
+                isLikelyEcho = true;
+              } else if (
                 transcriptionTimeSinceResponseEnd <
                 TIMING_THRESHOLDS.POST_RESPONSE_ECHO_MS
               ) {
-                // Happened soon after AI finished, but NOT similar - likely real user speech
+                // Happened soon after AI finished, but NOT similar and NOT a short/goodbye/name introduction phrase
+                // This is likely real user speech
                 console.log(
                   `✅ Accepting transcription (${transcriptionTimeSinceResponseEnd}ms after AI finished, ${(
                     similarity * 100
@@ -2001,10 +3026,63 @@ CALL ENDING - CRITICAL:
               !isInterruptionPhrase
             ) {
               // No AI response to compare, but happened soon after - be conservative
+              const lowerTranscript = userTranscript.toLowerCase();
               const isPolitePhrase = this.isCommonPolitePhrase(userTranscript);
+              const isNameIntroduction =
+                this.isNameIntroduction(userTranscript);
+              const isGoodbyePhrase =
+                this.isUserGoodbyePhrase(userTranscript) ||
+                lowerTranscript.includes("bye") ||
+                lowerTranscript.includes("goodbye");
+              // Check for "thank you" + "bye" combinations (common echo pattern)
+              const hasThankYouAndBye =
+                (lowerTranscript.includes("thank you") ||
+                  lowerTranscript.includes("thanks")) &&
+                (lowerTranscript.includes("bye") ||
+                  lowerTranscript.includes("goodbye"));
 
-              // Reject if it's a very short phrase (likely echo)
-              if (userTranscript.trim().split(/\s+/).length <= 3) {
+              // 🚨 CRITICAL FIX: Reject "thank you + bye" combinations within echo window
+              if (hasThankYouAndBye) {
+                console.log(
+                  `⚠️⚠️⚠️ LIKELY ECHO ("thank you + bye" combination ${transcriptionTimeSinceResponseEnd}ms after AI finished): "${userTranscript}" ⚠️⚠️⚠️`
+                );
+                console.log(
+                  `   Phrases containing both "thank you" and "bye" within ${TIMING_THRESHOLDS.POST_RESPONSE_ECHO_MS}ms after AI finishes are almost always echo`
+                );
+                console.log(
+                  `   This transcription will NOT be saved (likely AI echo)`
+                );
+                isLikelyEcho = true;
+              } else if (
+                // Reject goodbye phrases within echo window
+                isGoodbyePhrase &&
+                userTranscript.trim().split(/\s+/).length <= 4
+              ) {
+                console.log(
+                  `⚠️⚠️⚠️ LIKELY ECHO (goodbye phrase ${transcriptionTimeSinceResponseEnd}ms after AI finished): "${userTranscript}" ⚠️⚠️⚠️`
+                );
+                console.log(
+                  `   Goodbye phrases appearing within ${TIMING_THRESHOLDS.POST_RESPONSE_ECHO_MS}ms after AI finishes are likely echo`
+                );
+                console.log(
+                  `   This transcription will NOT be saved (likely AI echo)`
+                );
+                isLikelyEcho = true;
+              } else if (isNameIntroduction) {
+                // 🚨 CRITICAL: Reject name introductions within echo window (even without AI response to compare)
+                // Name introductions are often mis-transcribed echo
+                console.log(
+                  `⚠️⚠️⚠️ LIKELY ECHO (name introduction ${transcriptionTimeSinceResponseEnd}ms after AI finished): "${userTranscript}" ⚠️⚠️⚠️`
+                );
+                console.log(
+                  `   Name introductions appearing within ${TIMING_THRESHOLDS.POST_RESPONSE_ECHO_MS}ms after AI finishes are likely mis-transcribed echo`
+                );
+                console.log(
+                  `   This transcription will NOT be saved (likely AI echo)`
+                );
+                isLikelyEcho = true;
+              } else if (userTranscript.trim().split(/\s+/).length <= 3) {
+                // Reject if it's a very short phrase (likely echo)
                 console.log(
                   `⚠️⚠️⚠️ LIKELY ECHO (short phrase ${transcriptionTimeSinceResponseEnd}ms after AI finished): "${userTranscript}" ⚠️⚠️⚠️`
                 );
@@ -2033,14 +3111,76 @@ CALL ENDING - CRITICAL:
               }
             }
 
+            // 🚨 FINAL SAFETY CHECK: If AI is currently speaking, reject ANY non-interruption phrase as echo
+            // This ensures nothing can interrupt AI speaking except clear signals like 'wait', 'wait a sec', 'stop'
+            // BUT: Allow legitimate questions and longer phrases even during AI speech (user might be responding to a question)
+            if (
+              !isLikelyEcho &&
+              this.isProcessingResponse &&
+              this.responseStartTime > 0 &&
+              !isInterruptionPhrase
+            ) {
+              // Check if this is a legitimate question or longer phrase
+              const isQuestion = this.containsQuestion(userTranscript);
+              const wordCount = userTranscript.trim().split(/\s+/).length;
+              const isLongPhrase = wordCount >= 5; // Phrases with 5+ words are likely legitimate
+              const isLegitimateInput = isQuestion || isLongPhrase;
+
+              if (isLegitimateInput) {
+                const timeSinceStart = Date.now() - this.responseStartTime;
+                console.log(
+                  `⚠️  Transcription during AI speech BUT allowing through (legitimate ${
+                    isQuestion ? "question" : "longer phrase"
+                  }, ${timeSinceStart}ms since AI started): "${userTranscript}"`
+                );
+                console.log(
+                  `   Word count: ${wordCount}, isQuestion: ${isQuestion}`
+                );
+                // Allow it through - user might be responding to a question
+              } else {
+                const timeSinceStart = Date.now() - this.responseStartTime;
+                console.log(
+                  `🚫🚫🚫 FINAL SAFETY CHECK: Rejecting transcription during AI speech (${timeSinceStart}ms since AI started): "${userTranscript}" 🚫🚫🚫`
+                );
+                console.log(
+                  `   AI is currently speaking - only clear interruption signals like 'wait', 'wait a sec', 'stop' are allowed`
+                );
+                console.log(
+                  `   All other speech during AI response is treated as echo`
+                );
+                isLikelyEcho = true;
+              }
+            }
+
             // 🚨 CRITICAL: DO NOT save transcriptions that are likely echo
             // This prevents the AI's own voice from being saved as user speech
+            // BUT: Allow legitimate questions and longer phrases even if they might be echo
+            // This ensures the AI can still respond to real user input
             if (isLikelyEcho) {
-              console.log(
-                `🚫 REJECTING TRANSCRIPTION (likely echo/feedback): "${userTranscript}"`
-              );
-              this.suspectedSpeech = false; // Clear suspected flag
-              break; // Don't save, don't trigger response
+              // Check if this is a legitimate question or longer phrase
+              const isQuestion = this.containsQuestion(userTranscript);
+              const wordCount = userTranscript.trim().split(/\s+/).length;
+              const isLongPhrase = wordCount >= 5; // Phrases with 5+ words are likely legitimate
+              const isLegitimateInput = isQuestion || isLongPhrase;
+
+              if (isLegitimateInput) {
+                console.log(
+                  `⚠️  Transcription marked as echo BUT allowing through (legitimate ${
+                    isQuestion ? "question" : "longer phrase"
+                  }): "${userTranscript}"`
+                );
+                console.log(
+                  `   Word count: ${wordCount}, isQuestion: ${isQuestion}`
+                );
+                // Allow it through - treat as legitimate user input
+                isLikelyEcho = false;
+              } else {
+                console.log(
+                  `🚫 REJECTING TRANSCRIPTION (likely echo/feedback): "${userTranscript}"`
+                );
+                this.suspectedSpeech = false; // Clear suspected flag
+                break; // Don't save, don't trigger response
+              }
             }
 
             // If we get here, it passed all echo checks - it's likely real user speech
@@ -2127,70 +3267,134 @@ CALL ENDING - CRITICAL:
           if (this.isProcessingResponse) {
             const timeSinceResponseStart = this.getTimeSinceResponseStart();
             console.log(
-              `⚠️⚠️⚠️ AI IS CURRENTLY SPEAKING - DEFERRING RESPONSE REQUEST ⚠️⚠️⚠️`
+              `⚠️⚠️⚠️ AI IS CURRENTLY SPEAKING - ACCUMULATING TRANSCRIPT FOR LATER ⚠️⚠️⚠️`
             );
             console.log(
               `   AI started speaking ${timeSinceResponseStart}ms ago - will wait for AI to finish`
             );
             console.log(
-              `   User said: "${userTranscript}" - will respond AFTER AI finishes current response`
+              `   User said: "${userTranscript}" - will accumulate and respond AFTER AI finishes`
             );
             console.log(
-              `   📝 This transcription will be saved and processed after AI response completes`
+              `   📝 This transcription will be accumulated and processed after AI response completes`
             );
-            console.log(
-              `   ✅ AI will finish its current response before responding to this new input`
-            );
-            // Save the transcript now, but don't request a response yet
-            // The response will be requested after AI finishes (in response.done handler)
-            // Store transcription for validation against AI response
-            const transcriptId = uuidv4();
-            this.pendingTranscriptionValidation.set(transcriptId, {
-              transcript: userTranscript,
-              timestamp: transcriptionTimestamp,
-            });
+            // Accumulate transcript but don't start timer yet (will start after AI finishes)
+            // Check if this is a continuation of previous speech
+            const timeSinceLastTranscript =
+              this.lastTranscriptTime > 0
+                ? Date.now() - this.lastTranscriptTime
+                : Infinity;
+
+            if (
+              timeSinceLastTranscript < TIMING_THRESHOLDS.CONVERSATION_WINDOW_MS
+            ) {
+              // This is a continuation - accumulate it
+              if (this.accumulatedTranscript) {
+                this.accumulatedTranscript += " " + userTranscript;
+              } else {
+                this.accumulatedTranscript = userTranscript;
+              }
+            } else {
+              // New conversation - start fresh accumulation
+              this.accumulatedTranscript = userTranscript;
+            }
+            this.lastTranscriptTime = Date.now();
             // Update last processed transcript so we know what to respond to later
             // This will be used in response.done handler to respond after AI finishes
             this.lastProcessedUserTranscript = userTranscript;
+            // Don't start timer yet - will start after AI finishes speaking
             break; // Exit early - don't request response while AI is speaking
           }
 
-          // 🚨 PREVENT INFINITE LOOPS: Check if we've already responded to this transcript
-          if (this.respondedToTranscripts.has(userTranscript)) {
+          // 🚨 CRITICAL: If AI just asked a question, this is NEW user input responding to that question
+          // Clear any old accumulated transcript and start fresh
+          const aiAskedQuestion =
+            this.lastAIResponse && this.containsQuestion(this.lastAIResponse);
+          if (aiAskedQuestion && this.accumulatedTranscript.trim()) {
             console.log(
-              `⚠️⚠️⚠️ SKIPPING LOOP - Already responded to transcript: "${userTranscript}" ⚠️⚠️⚠️`
+              `❓ User responding to AI's question - clearing old accumulated transcript and starting fresh`
             );
             console.log(
-              `   This transcript was already processed - not responding again`
+              `   Old accumulated transcript (cleared): "${this.accumulatedTranscript}"`
             );
-            // Clear lastProcessedUserTranscript if it matches to prevent loops
-            if (this.lastProcessedUserTranscript === userTranscript) {
-              this.lastProcessedUserTranscript = "";
-            }
-            break; // Exit early - don't respond again
+            console.log(`   New user input: "${userTranscript}"`);
+            // Cancel any pending response to old accumulated transcript
+            this.clearPendingResponseRequest();
+            this.clearConversationWindowTimer();
+            this.accumulatedTranscript = "";
+            this.lastTranscriptTime = 0;
           }
 
-          // Track which transcript is triggering this response
-          this.lastUserTranscriptForResponse = userTranscript;
-          // Mark this transcript as responded to BEFORE requesting response (prevent race conditions)
-          this.respondedToTranscripts.add(userTranscript);
+          // 🚨 CRITICAL: Cancel any pending response requests when new speech comes in
+          // This ensures we only respond to the most recent user input
+          if (this.hasPendingResponseRequest || this.conversationWindowTimer) {
+            console.log(
+              `🔄 New user speech detected - cancelling pending response to ensure we only respond to most recent input`
+            );
+            this.clearPendingResponseRequest();
+            this.clearConversationWindowTimer();
+          }
 
-          // Store transcription for validation against AI response
-          const transcriptId = uuidv4();
-          this.pendingTranscriptionValidation.set(transcriptId, {
-            transcript: userTranscript,
-            timestamp: transcriptionTimestamp,
-          });
+          // 🚨 SOLUTION 2: CONVERSATION WINDOW - Accumulate consecutive speech and respond after 3s silence
+          // Check if this is a continuation of previous speech (within conversation window)
+          const timeSinceLastTranscript =
+            this.lastTranscriptTime > 0
+              ? Date.now() - this.lastTranscriptTime
+              : Infinity;
 
+          if (
+            timeSinceLastTranscript < TIMING_THRESHOLDS.CONVERSATION_WINDOW_MS
+          ) {
+            // This is a continuation - accumulate it
+            console.log(
+              `📝📝📝 ACCUMULATING TRANSCRIPT (${timeSinceLastTranscript}ms since last): "${userTranscript}" 📝📝📝`
+            );
+            if (this.accumulatedTranscript) {
+              this.accumulatedTranscript += " " + userTranscript;
+            } else {
+              this.accumulatedTranscript = userTranscript;
+            }
+            console.log(
+              `📚 Accumulated transcript so far: "${this.accumulatedTranscript}"`
+            );
+          } else {
+            // New conversation - start fresh accumulation
+            console.log(
+              `🆕 NEW CONVERSATION - Starting fresh accumulation: "${userTranscript}"`
+            );
+            // Clear old accumulated transcript to ensure we only respond to new input
+            if (this.accumulatedTranscript.trim()) {
+              console.log(
+                `   Clearing old accumulated transcript: "${this.accumulatedTranscript}"`
+              );
+              // Remove from respondedToTranscripts so we can respond to new input
+              this.respondedToTranscripts.delete(this.accumulatedTranscript);
+            }
+            this.accumulatedTranscript = userTranscript;
+          }
+
+          // Update last transcript time
+          this.lastTranscriptTime = Date.now();
+
+          // Clear any existing conversation window timer
+          this.clearConversationWindowTimer();
+
+          // Start/reset the 1-second timer
           console.log(
-            `🔄🔄🔄 REQUESTING AI RESPONSE TO: "${userTranscript}" 🔄🔄🔄`
+            `⏱️  Starting 1-second silence timer (will respond if no more speech)`
           );
-          console.log(
-            `📋 Stored transcription for validation (ID: ${transcriptId})`
-          );
+          this.conversationWindowTimer = setTimeout(() => {
+            this.conversationWindowTimer = null;
+            console.log(
+              `⏱️  1 second of silence detected - processing accumulated transcript`
+            );
+            this.handleAccumulatedTranscriptResponse();
+          }, TIMING_THRESHOLDS.CONVERSATION_WINDOW_MS);
 
-          // Request AI response
-          this.requestAIResponse(userTranscript);
+          // Don't request response immediately - wait for 1 second of silence
+          console.log(
+            `⏸️  Waiting for 1 second of silence before responding to accumulated speech`
+          );
           break;
 
         case "input_audio_buffer.speech_started":
@@ -2287,8 +3491,32 @@ CALL ENDING - CRITICAL:
             console.log(
               "ℹ️  Ignoring harmless cancellation error - response was not active"
             );
+            // Even for harmless errors, clear state flags if they're stuck
+            // This ensures the AI can respond even after a cancelled response
+            if (this.isProcessingResponse || this.hasPendingResponseRequest) {
+              console.log(
+                "🔧 Clearing state flags after cancellation error to allow future responses"
+              );
+              this.isProcessingResponse = false;
+              this.hasPendingResponseRequest = false;
+              this.clearPendingResponseRequest();
+              this.currentResponseHasAudio = false;
+              this.currentResponseAudioDone = false;
+            }
           } else {
             console.error("❌ OpenAI Realtime API error:", message.error);
+            // 🚨 CRITICAL: Clear state flags on non-harmless errors
+            // This prevents the AI from getting stuck in a non-responsive state
+            console.log(
+              "🔧 Clearing response state flags due to error to allow recovery"
+            );
+            this.isProcessingResponse = false;
+            this.hasPendingResponseRequest = false;
+            this.clearPendingResponseRequest();
+            this.currentResponseHasAudio = false;
+            this.currentResponseAudioDone = false;
+            // Reset the stop audio flag in case it's stuck
+            this.shouldStopAudio = false;
           }
           break;
 
@@ -2503,6 +3731,74 @@ CALL ENDING - CRITICAL:
     const responseLower = aiResponse.toLowerCase();
     const transcriptLower = userTranscript.toLowerCase();
 
+    // 🚨 CRITICAL: Check for COMPLETE CONTEXT MISMATCH
+    // If AI response has NO semantic relation to the transcription, it's likely responding to system prompt context
+    const transcriptWords = transcriptLower
+      .split(/\s+/)
+      .filter((w) => w.length > 3); // Only meaningful words (length > 3)
+    const responseWords = responseLower
+      .split(/\s+/)
+      .filter((w) => w.length > 3);
+
+    // Extract key semantic terms from both
+    const transcriptKeyTerms = this.extractKeyTerms(userTranscript);
+    const responseKeyTerms = this.extractKeyTerms(aiResponse);
+
+    // Check for semantic overlap (common words or related concepts)
+    const commonWords = transcriptWords.filter((w) =>
+      responseWords.includes(w)
+    );
+
+    // Calculate semantic similarity
+    const semanticSimilarity = this.calculateSemanticSimilarity(
+      transcriptKeyTerms,
+      responseKeyTerms
+    );
+
+    // 🚨 DETECT COMPLETE CONTEXT MISMATCH
+    // If there's no semantic overlap and no common words, AI is likely responding to system prompt, not transcription
+    if (
+      commonWords.length === 0 &&
+      semanticSimilarity < 0.1 &&
+      transcriptWords.length > 0 &&
+      responseWords.length > 5
+    ) {
+      console.error(
+        `🚨🚨🚨 CRITICAL: COMPLETE CONTEXT MISMATCH DETECTED 🚨🚨🚨`
+      );
+      console.error(`   User Transcription: "${userTranscript}"`);
+      console.error(`   AI Response: "${aiResponse.substring(0, 200)}..."`);
+      console.error(
+        `   📊 Semantic similarity: ${(semanticSimilarity * 100).toFixed(1)}%`
+      );
+      console.error(`   📊 Common words: ${commonWords.length}`);
+      console.error(
+        `   ⚠️  WARNING: AI response has NO relation to the transcription!`
+      );
+      console.error(`   💡 This likely means:`);
+      console.error(
+        `      1. The transcription is completely wrong (poor audio quality/echo)`
+      );
+      console.error(
+        `      2. The AI is responding to system prompt context instead of user speech`
+      );
+      console.error(
+        `      3. There may be audio encoding/resampling issues causing transcription errors`
+      );
+      console.error(`   🔧 RECOMMENDED ACTIONS:`);
+      console.error(`      - Check audio quality and encoding pipeline`);
+      console.error(
+        `      - Verify audio sample rate conversion (8kHz → 16kHz → 24kHz)`
+      );
+      console.error(`      - Check for echo/feedback in audio stream`);
+      console.error(
+        `      - Consider adjusting VAD threshold if speech detection is poor`
+      );
+
+      // Store this as a critical error for later analysis
+      // In production, you might want to emit this as an event or log to monitoring system
+    }
+
     // Check for common transcription errors that might be corrected by AI understanding
     const commonMismatches = [
       { wrong: "phone response", correct: "full refund" },
@@ -2558,26 +3854,17 @@ CALL ENDING - CRITICAL:
       console.log(
         `   🔍 Note: GPT-4o Realtime's understanding is often more accurate than its transcription`
       );
-    } else {
+    } else if (commonWords.length > 0 && semanticSimilarity > 0.3) {
       // Log when transcription and response align well (for debugging)
-      const transcriptWords = transcriptLower
-        .split(/\s+/)
-        .filter((w) => w.length > 2);
-      const responseWords = responseLower
-        .split(/\s+/)
-        .filter((w) => w.length > 2);
-      const commonWords = transcriptWords.filter((w) =>
-        responseWords.includes(w)
+      console.log(
+        `✅ Transcription validation: AI response aligns with transcription`
       );
-
-      if (commonWords.length > 0) {
-        console.log(
-          `✅ Transcription validation: AI response aligns with transcription`
-        );
-        console.log(
-          `   Common context words: ${commonWords.slice(0, 5).join(", ")}`
-        );
-      }
+      console.log(
+        `   Common context words: ${commonWords.slice(0, 5).join(", ")}`
+      );
+      console.log(
+        `   Semantic similarity: ${(semanticSimilarity * 100).toFixed(1)}%`
+      );
     }
 
     // Clean up old validation entries (older than 30 seconds)
@@ -2587,6 +3874,423 @@ CALL ENDING - CRITICAL:
         this.pendingTranscriptionValidation.delete(id);
       }
     }
+  }
+
+  /**
+   * Extract key semantic terms from text (removes common stop words)
+   */
+  private extractKeyTerms(text: string): string[] {
+    const stopWords = new Set([
+      "the",
+      "a",
+      "an",
+      "and",
+      "or",
+      "but",
+      "in",
+      "on",
+      "at",
+      "to",
+      "for",
+      "of",
+      "with",
+      "by",
+      "from",
+      "as",
+      "is",
+      "was",
+      "are",
+      "were",
+      "been",
+      "be",
+      "have",
+      "has",
+      "had",
+      "do",
+      "does",
+      "did",
+      "will",
+      "would",
+      "should",
+      "could",
+      "may",
+      "might",
+      "must",
+      "can",
+      "this",
+      "that",
+      "these",
+      "those",
+      "i",
+      "you",
+      "he",
+      "she",
+      "it",
+      "we",
+      "they",
+      "me",
+      "him",
+      "her",
+      "us",
+      "them",
+      "my",
+      "your",
+      "his",
+      "her",
+      "its",
+      "our",
+      "their",
+      "what",
+      "which",
+      "who",
+      "whom",
+      "whose",
+      "where",
+      "when",
+      "why",
+      "how",
+      "all",
+      "each",
+      "every",
+      "both",
+      "few",
+      "more",
+      "most",
+      "other",
+      "some",
+      "such",
+      "no",
+      "nor",
+      "not",
+      "only",
+      "own",
+      "same",
+      "so",
+      "than",
+      "too",
+      "very",
+      "just",
+      "now",
+      "then",
+      "here",
+      "there",
+      "about",
+      "after",
+      "before",
+      "during",
+      "into",
+      "through",
+      "until",
+      "while",
+      "up",
+      "down",
+      "out",
+      "off",
+      "over",
+      "under",
+      "again",
+      "further",
+      "once",
+      "also",
+      "well",
+      "say",
+      "said",
+      "get",
+      "got",
+      "go",
+      "went",
+      "come",
+      "came",
+      "know",
+      "think",
+      "see",
+      "look",
+      "want",
+      "need",
+      "take",
+      "give",
+      "make",
+      "help",
+    ]);
+
+    return text
+      .toLowerCase()
+      .replace(/[^\w\s]/g, " ")
+      .split(/\s+/)
+      .filter((w) => w.length > 3 && !stopWords.has(w));
+  }
+
+  /**
+   * Calculate semantic similarity between two sets of key terms
+   * Returns a value between 0 (no similarity) and 1 (identical)
+   */
+  private calculateSemanticSimilarity(
+    terms1: string[],
+    terms2: string[]
+  ): number {
+    if (terms1.length === 0 || terms2.length === 0) return 0;
+
+    // Simple word overlap similarity
+    const set1 = new Set(terms1);
+    const set2 = new Set(terms2);
+
+    const intersection = new Set([...set1].filter((x) => set2.has(x)));
+    const union = new Set([...set1, ...set2]);
+
+    // Jaccard similarity
+    return intersection.size / union.size;
+  }
+
+  /**
+   * Assess transcription quality to detect nonsensical or poor transcriptions
+   * Returns quality score and issues found
+   */
+  private assessTranscriptionQuality(transcript: string): {
+    isValid: boolean;
+    score: number;
+    issues: string[];
+    isNonsensical: boolean;
+    hasUnusualPatterns: boolean;
+  } {
+    const issues: string[] = [];
+    let score = 1.0;
+    const transcriptLower = transcript.toLowerCase().trim();
+
+    // Check for completely nonsensical patterns
+    // Common patterns that indicate transcription errors:
+    const nonsensicalPatterns = [
+      // Unusual phrase patterns that don't make sense in customer service context
+      /walk.*down.*chamber/i,
+      /can i walk/i,
+      /right down the/i,
+    ];
+
+    // Check for sequences of very short words, but exclude common valid phrases
+    const shortWordSequencePattern = /\b\w{1,2}\s+\w{1,2}\s+\w{1,2}\b/;
+    const hasShortWordSequence = shortWordSequencePattern.test(transcript);
+
+    // Valid phrases that might match the short word pattern but are actually correct
+    const validShortPhrases = [
+      /it\s+to\s+be/i,
+      /to\s+be/i,
+      /i\s+am/i,
+      /i\s+am\s+[a-z]/i,
+      /so\s+you\s+want/i,
+      /if\s+you\s+want/i,
+      /as\s+you\s+can/i,
+      /is\s+it\s+[a-z]/i,
+      /do\s+you\s+want/i,
+      /we\s+can\s+[a-z]/i,
+      /we\s+will\s+[a-z]/i,
+      /i\s+will\s+[a-z]/i,
+      /i\s+can\s+[a-z]/i,
+      /it\s+is\s+[a-z]/i,
+      /it\s+was\s+[a-z]/i,
+      /at\s+the\s+[a-z]/i,
+      /in\s+the\s+[a-z]/i,
+      /on\s+the\s+[a-z]/i,
+      /of\s+the\s+[a-z]/i,
+      /to\s+the\s+[a-z]/i,
+      /for\s+the\s+[a-z]/i,
+      /by\s+the\s+[a-z]/i,
+      /or\s+the\s+[a-z]/i,
+      /as\s+the\s+[a-z]/i,
+      /if\s+the\s+[a-z]/i,
+      /is\s+the\s+[a-z]/i,
+      /are\s+the\s+[a-z]/i,
+      /was\s+the\s+[a-z]/i,
+      /were\s+the\s+[a-z]/i,
+    ];
+
+    const isValidShortPhrase = validShortPhrases.some((pattern) =>
+      pattern.test(transcript)
+    );
+
+    // Only flag as nonsensical if it has short word sequence AND it's not a valid phrase
+    const hasNonsensicalPattern =
+      nonsensicalPatterns.some((pattern) => pattern.test(transcript)) ||
+      (hasShortWordSequence && !isValidShortPhrase);
+
+    // Check for unusual word patterns
+    const words = transcriptLower.split(/\s+/);
+    const unusualWordCount = words.filter((w) => {
+      // Very short words (1-2 chars) that aren't common
+      if (
+        w.length <= 2 &&
+        ![
+          "i",
+          "a",
+          "an",
+          "to",
+          "of",
+          "in",
+          "on",
+          "at",
+          "it",
+          "is",
+          "as",
+          "be",
+          "we",
+          "he",
+          "me",
+          "my",
+          "up",
+          "go",
+          "no",
+          "so",
+          "do",
+          "if",
+          "or",
+          "us",
+          "am",
+        ].includes(w)
+      ) {
+        return true;
+      }
+      return false;
+    }).length;
+
+    // Check for repetition of the same word (indicates stuttering or echo)
+    const wordFreq: Record<string, number> = {};
+    words.forEach((w) => {
+      if (w.length > 3) {
+        wordFreq[w] = (wordFreq[w] || 0) + 1;
+      }
+    });
+    const hasExcessiveRepetition = Object.values(wordFreq).some(
+      (count) => count > 3
+    );
+
+    // Check for common English phrases vs random word combinations
+    // Valid greetings/phrases in customer service context
+    const validGreetings = [
+      /hello/i,
+      /hi/i,
+      /hey/i,
+      /good morning/i,
+      /good afternoon/i,
+      /good evening/i,
+      /how can i help/i,
+      /how may i help/i,
+      /what can i do/i,
+      /how are you/i,
+      /thank you/i,
+      /thanks/i,
+      /you're welcome/i,
+      /sure/i,
+      /okay/i,
+      /ok/i,
+      /yes/i,
+      /no/i,
+      /please/i,
+    ];
+
+    const isCommonPhrase = validGreetings.some((pattern) =>
+      pattern.test(transcript)
+    );
+
+    // Calculate score based on various factors
+    if (hasNonsensicalPattern && !isCommonPhrase) {
+      score -= 0.5;
+      issues.push("Contains nonsensical patterns");
+    }
+
+    if (unusualWordCount > words.length * 0.3) {
+      score -= 0.2;
+      issues.push(
+        `Too many unusual short words (${unusualWordCount}/${words.length})`
+      );
+    }
+
+    if (hasExcessiveRepetition) {
+      score -= 0.2;
+      issues.push("Excessive word repetition (possible echo/stuttering)");
+    }
+
+    // Check if transcript makes semantic sense
+    // If it's a greeting or common phrase, it's more likely valid
+    if (!isCommonPhrase && words.length > 3) {
+      // Check if words form a coherent sentence structure
+      // Very basic check: common English words should be present
+      const commonWords = [
+        "the",
+        "a",
+        "an",
+        "and",
+        "or",
+        "but",
+        "in",
+        "on",
+        "at",
+        "to",
+        "for",
+        "of",
+        "with",
+        "by",
+        "from",
+        "is",
+        "was",
+        "are",
+        "were",
+        "this",
+        "that",
+        "what",
+        "which",
+        "who",
+        "where",
+        "when",
+        "why",
+        "how",
+        "can",
+        "could",
+        "will",
+        "would",
+        "should",
+        "may",
+        "might",
+        "must",
+      ];
+
+      const hasCommonWords = commonWords.some((cw) =>
+        transcriptLower.includes(cw)
+      );
+
+      // If it's a longer phrase without common words, it might be nonsensical
+      if (!hasCommonWords && words.length > 5) {
+        score -= 0.3;
+        issues.push("Lacks common English words (may be nonsensical)");
+      }
+    }
+
+    // Check for extremely unlikely combinations
+    // Example: "Can I walk right down the chamber, please?" when user likely said "hello, how can I help you"
+    const unlikelyCombinations = [
+      /walk.*chamber/i,
+      /walk.*down/i,
+      /chamber.*please/i,
+    ];
+
+    if (
+      unlikelyCombinations.some((pattern) => pattern.test(transcript)) &&
+      !isCommonPhrase
+    ) {
+      score -= 0.4;
+      issues.push("Contains unlikely word combinations");
+    }
+
+    // Ensure score doesn't go below 0
+    score = Math.max(0, score);
+
+    // Transcription is invalid if score is very low (< 0.4) or has critical issues
+    const isValid = score >= 0.4 && !hasNonsensicalPattern;
+
+    return {
+      isValid,
+      score,
+      issues,
+      isNonsensical: hasNonsensicalPattern,
+      hasUnusualPatterns: unusualWordCount > words.length * 0.2,
+    };
   }
 
   private cleanup() {

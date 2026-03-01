@@ -4,7 +4,7 @@ import dotenv from "dotenv";
 dotenv.config();
 
 export const config = {
-  port: process.env.PORT || 3001,
+  port: parseInt(process.env.PORT || "3001", 10),
 
   // Twilio configuration
   twilio: {
@@ -42,7 +42,7 @@ export const config = {
     // 2000ms = 2 seconds - gives user comfortable time to pause and continue speaking
     silenceDurationMs: parseInt(
       process.env.OPENAI_SILENCE_DURATION_MS || "2000",
-      10
+      10,
     ),
     // Response delay: Delay before requesting AI response (default: 0ms = immediate, range: 0-300ms)
     // 0ms = immediate response - AI responds instantly to user's question
@@ -51,7 +51,7 @@ export const config = {
     // 0ms = immediate interruption - AI stops instantly when user speaks
     echoGracePeriodMs: parseInt(
       process.env.OPENAI_ECHO_GRACE_PERIOD_MS || "0",
-      10
+      10,
     ),
   },
 
@@ -79,6 +79,32 @@ export const config = {
     serviceRoleKey: process.env.SUPABASE_SERVICE_ROLE_KEY || "",
   },
 
+  // Google Places / search provider configuration
+  googlePlaces: {
+    apiKey: process.env.GOOGLE_MAPS_API_KEY || "",
+    textSearchUrl:
+      process.env.GOOGLE_PLACES_TEXT_SEARCH_URL ||
+      "https://maps.googleapis.com/maps/api/place/textsearch/json",
+    detailsUrl:
+      process.env.GOOGLE_PLACES_DETAILS_URL ||
+      "https://maps.googleapis.com/maps/api/place/details/json",
+    radiusMeters: parseInt(
+      process.env.GOOGLE_PLACES_RADIUS_METERS || "7500",
+      10,
+    ),
+    defaultKeyword: process.env.GOOGLE_PLACES_DEFAULT_KEYWORD || "clinic",
+  },
+
+  // Redis cache configuration
+  redis: {
+    url: process.env.REDIS_URL || "",
+    tls: process.env.REDIS_TLS === "true",
+    placesCacheTtlSeconds: parseInt(
+      process.env.PLACES_CACHE_TTL_SECONDS || "43200",
+      10,
+    ), // 12 hours default
+  },
+
   // CORS configuration
   cors: {
     origin: process.env.CORS_ORIGIN || "http://localhost:3000",
@@ -88,6 +114,11 @@ export const config = {
   call: {
     maxDurationMinutes: 15,
     recordCalls: true,
+  },
+
+  // Auth: when true, requireAuth middleware allows unauthenticated requests (dev/testing only)
+  auth: {
+    allowNoAuth: process.env.ALLOW_NO_AUTH === "true",
   },
 };
 
@@ -105,7 +136,7 @@ export function validateConfig() {
 
   if (missing.length > 0) {
     console.error(
-      `❌ ERROR: Missing required environment variables: ${missing.join(", ")}`
+      `❌ ERROR: Missing required environment variables: ${missing.join(", ")}`,
     );
     console.error("❌ The AI agent WILL NOT WORK without these variables!");
     console.error("❌ Please add them to backend/.env file");
@@ -122,10 +153,22 @@ export function validateConfig() {
     console.log("✅ Supabase authentication is configured");
   } else {
     console.warn(
-      "⚠️  Supabase credentials not set - authentication will not work"
+      "⚠️  Supabase credentials not set - authentication will not work",
     );
     console.warn(
-      "⚠️  Add SUPABASE_URL, SUPABASE_ANON_KEY, and SUPABASE_SERVICE_ROLE_KEY to .env"
+      "⚠️  Add SUPABASE_URL, SUPABASE_ANON_KEY, and SUPABASE_SERVICE_ROLE_KEY to .env",
+    );
+  }
+
+  if (!process.env.GOOGLE_MAPS_API_KEY) {
+    console.warn(
+      "⚠️  GOOGLE_MAPS_API_KEY not set - clinic search will fall back to mock data",
+    );
+  }
+
+  if (!process.env.REDIS_URL) {
+    console.warn(
+      "⚠️  REDIS_URL not set - quote search caching will be disabled",
     );
   }
 
@@ -134,7 +177,13 @@ export function validateConfig() {
     console.log(`✅ PUBLIC_URL set: ${process.env.PUBLIC_URL}`);
   } else {
     console.warn(
-      "⚠️  PUBLIC_URL not set - using localhost (Twilio webhooks will not work)"
+      "⚠️  PUBLIC_URL not set - using localhost (Twilio webhooks will not work)",
+    );
+  }
+
+  if (process.env.ALLOW_NO_AUTH === "true") {
+    console.warn(
+      "⚠️  ALLOW_NO_AUTH=true: unauthenticated requests are allowed (dev/testing only; do not use in production)",
     );
   }
 }

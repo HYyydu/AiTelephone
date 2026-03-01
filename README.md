@@ -1,12 +1,12 @@
 # 🤖 AI Customer Call System
 
-An intelligent phone calling system powered by AI that can make automated calls to customers with specific purposes and goals. The system uses GPT-4 for conversation intelligence, Deepgram for real-time speech recognition, OpenAI TTS for natural voice synthesis, and Twilio for telephony.
+An intelligent phone calling system powered by AI that can make automated calls to customers with specific purposes and goals. The system uses GPT-4o Realtime for conversation intelligence and speech recognition, OpenAI TTS for natural voice synthesis, and Twilio for telephony.
 
 ## ✨ Features
 
 - 📞 **Automated Phone Calls** - Make AI-powered calls to any phone number
 - 🎯 **Purpose-Driven Conversations** - Define specific goals for each call
-- 🎤 **Real-time Speech Recognition** - Powered by Deepgram
+- 🎤 **Real-time Speech Recognition** - Powered by GPT-4o Realtime
 - 🤖 **Intelligent Responses** - GPT-4 generates contextual, natural conversations
 - 🔊 **Natural Voice Synthesis** - OpenAI TTS with multiple voice options
 - 📝 **Live Transcription** - Real-time transcript of AI and customer conversation
@@ -24,10 +24,10 @@ An intelligent phone calling system powered by AI that can make automated calls 
                                │
                     ┌──────────┼──────────┐
                     │          │          │
-            ┌───────▼────┐ ┌──▼────┐ ┌──▼──────┐
-            │  OpenAI    │ │Deepgram│ │ Socket  │
-            │ GPT-4/TTS  │ │  (STT) │ │  .io    │
-            └────────────┘ └────────┘ └─────────┘
+            ┌───────▼────┐ ┌──▼──────┐
+            │  OpenAI    │ │ Socket  │
+            │GPT-4o/TTS  │ │  .io    │
+            └────────────┘ └─────────┘
 ```
 
 ## 🚀 Getting Started
@@ -37,7 +37,6 @@ An intelligent phone calling system powered by AI that can make automated calls 
 - Node.js 18+ and npm
 - Twilio account with phone number ([Sign up](https://www.twilio.com/try-twilio))
 - OpenAI API key ([Get key](https://platform.openai.com/api-keys))
-- Deepgram API key ([Get key](https://console.deepgram.com))
 
 ### Installation
 
@@ -60,6 +59,7 @@ cp .env.example .env
 ```
 
 Required environment variables for backend (`.env`):
+
 ```env
 # Twilio Configuration
 TWILIO_ACCOUNT_SID=your_account_sid
@@ -68,9 +68,6 @@ TWILIO_PHONE_NUMBER=+1234567890
 
 # OpenAI Configuration
 OPENAI_API_KEY=your_openai_key
-
-# Deepgram Configuration
-DEEPGRAM_API_KEY=your_deepgram_key
 
 # Server Configuration
 PORT=3001
@@ -89,6 +86,7 @@ cp .env.local.example .env.local
 ```
 
 Frontend environment variables (`.env.local`):
+
 ```env
 NEXT_PUBLIC_API_URL=http://localhost:3001
 NEXT_PUBLIC_WS_URL=http://localhost:3001
@@ -123,12 +121,14 @@ Navigate to `http://localhost:3000` and start making AI calls! 🎉
 ### Making Your First Call
 
 1. **Fill out the call form:**
+
    - Enter phone number in international format (e.g., +15551234567)
    - Describe the purpose (what the AI should accomplish)
    - Select voice preference
    - Add optional additional instructions
 
 2. **Start the call:**
+
    - Click "Start Call"
    - The system will initiate the call via Twilio
    - You can monitor the call in real-time
@@ -141,25 +141,28 @@ Navigate to `http://localhost:3000` and start making AI calls! 🎉
 ### Example Use Cases
 
 **Customer Service - Product Return**
+
 ```
 Phone: +15551234567
-Purpose: Customer wants to return strawberries purchased yesterday 
+Purpose: Customer wants to return strawberries purchased yesterday
          due to quality issues. Process return and schedule pickup.
 Instructions: Be empathetic, offer full refund, apologize for inconvenience
 ```
 
 **Appointment Scheduling**
+
 ```
 Phone: +15559876543
-Purpose: Schedule a dental appointment for the customer. Find available 
+Purpose: Schedule a dental appointment for the customer. Find available
          slots next week and confirm their preferred date/time.
 Instructions: Be friendly and accommodating
 ```
 
 **Customer Feedback Survey**
+
 ```
 Phone: +15551112222
-Purpose: Conduct a brief satisfaction survey about their recent purchase. 
+Purpose: Conduct a brief satisfaction survey about their recent purchase.
          Ask 3-4 questions about product quality and service.
 Instructions: Keep it short (under 3 minutes), thank them for their time
 ```
@@ -167,6 +170,7 @@ Instructions: Keep it short (under 3 minutes), thank them for their time
 ## 🛠️ Technology Stack
 
 ### Frontend
+
 - **Framework:** Next.js 16 (App Router)
 - **Language:** TypeScript
 - **Styling:** Tailwind CSS
@@ -176,12 +180,13 @@ Instructions: Keep it short (under 3 minutes), thank them for their time
 - **Date Formatting:** date-fns
 
 ### Backend
+
 - **Runtime:** Node.js
 - **Framework:** Express.js
 - **Language:** TypeScript
 - **Telephony:** Twilio SDK
-- **AI/LLM:** OpenAI GPT-4
-- **Speech-to-Text:** Deepgram
+- **AI/LLM:** OpenAI GPT-4o Realtime
+- **Speech-to-Text:** GPT-4o Realtime (built-in)
 - **Text-to-Speech:** OpenAI TTS
 - **Real-time:** Socket.io
 - **Storage:** In-memory (PostgreSQL ready)
@@ -211,7 +216,7 @@ AiCostumerCall/
     │   │   └── webhooks.ts         # Twilio webhooks
     │   ├── services/
     │   │   ├── telephony.ts        # Twilio integration
-    │   │   ├── transcription.ts    # Deepgram STT
+    │   │   ├── realtime-api.ts      # GPT-4o Realtime
     │   │   ├── ai-brain.ts         # GPT-4 logic
     │   │   ├── tts.ts              # Text-to-speech
     │   │   └── conversation-manager.ts  # Orchestration
@@ -232,22 +237,26 @@ This project is optimized for deployment on Vercel. We've created comprehensive 
 📚 **Choose your guide:**
 
 - **⚡ Quick Start (15 min)**: [QUICK_DEPLOY_VERCEL.md](./QUICK_DEPLOY_VERCEL.md)
+
   - Fast track deployment guide
   - Essential steps only
   - Perfect for getting started quickly
 
 - **📖 Complete Guide (40 min)**: [VERCEL_DEPLOYMENT_GUIDE.md](./VERCEL_DEPLOYMENT_GUIDE.md)
+
   - Detailed step-by-step walkthrough
   - Architecture explanations
   - Best practices and optimization tips
   - Cost estimates and scaling advice
 
 - **🔐 Environment Setup**: [VERCEL_ENV_TEMPLATE.md](./VERCEL_ENV_TEMPLATE.md)
+
   - Copy-paste templates for all environment variables
   - Where to find credentials
   - Security best practices
 
 - **🐛 Troubleshooting**: [VERCEL_TROUBLESHOOTING.md](./VERCEL_TROUBLESHOOTING.md)
+
   - Common issues and solutions
   - Debugging tools
   - Pro tips
@@ -258,6 +267,7 @@ This project is optimized for deployment on Vercel. We've created comprehensive 
   - Learning paths
 
 **Quick Deploy Command:**
+
 ```bash
 # 1. Push to Git
 git add .
@@ -288,6 +298,7 @@ See deployment guides for more details.
 ### Voice Options
 
 The system supports 4 voice types:
+
 - `professional_female` - Nova (default)
 - `professional_male` - Onyx
 - `friendly_female` - Shimmer
@@ -296,6 +307,7 @@ The system supports 4 voice types:
 ### Call Settings
 
 Default settings in `backend/src/config/index.ts`:
+
 - Max call duration: 15 minutes
 - Recording: Enabled
 - Model: GPT-4
@@ -304,6 +316,7 @@ Default settings in `backend/src/config/index.ts`:
 ## 📊 API Endpoints
 
 ### Calls
+
 - `POST /api/calls` - Create and initiate a new call
 - `GET /api/calls` - Get all calls
 - `GET /api/calls/:id` - Get specific call
@@ -312,10 +325,12 @@ Default settings in `backend/src/config/index.ts`:
 - `DELETE /api/calls/:id` - Delete a call
 
 ### Webhooks
+
 - `POST /api/webhooks/twilio/status` - Twilio status updates
 - `POST /api/webhooks/twilio/voice` - Twilio voice instructions
 
 ### WebSocket Events
+
 - `transcript` - New transcript message
 - `call_status` - Call status update
 - `call_ended` - Call completed
@@ -323,11 +338,11 @@ Default settings in `backend/src/config/index.ts`:
 ## 🚧 Development Status
 
 ### ✅ Completed Features
+
 - ✅ Frontend with Next.js and beautiful UI
 - ✅ Backend API with Express
 - ✅ Twilio integration for calls
-- ✅ OpenAI GPT-4 for conversations
-- ✅ Deepgram for speech recognition
+- ✅ OpenAI GPT-4o Realtime for conversations and speech recognition
 - ✅ OpenAI TTS for voice synthesis
 - ✅ Real-time WebSocket updates
 - ✅ Live transcript viewing
@@ -335,6 +350,7 @@ Default settings in `backend/src/config/index.ts`:
 - ✅ Environment configuration
 
 ### 🚧 In Progress / TODO
+
 - ⏳ PostgreSQL database integration (currently in-memory)
 - ⏳ Twilio Media Streams for bidirectional audio
 - ⏳ User authentication
@@ -346,18 +362,20 @@ Default settings in `backend/src/config/index.ts`:
 ## 💰 Cost Estimates
 
 **Per Call (5-minute average):**
+
 - Twilio: ~$0.10 - $0.15
-- OpenAI GPT-4: ~$0.05 - $0.10
+- OpenAI GPT-4o Realtime: ~$0.05 - $0.10
 - OpenAI TTS: ~$0.03 - $0.05
-- Deepgram STT: ~$0.02
-- **Total: ~$0.20 - $0.35 per call**
+- **Total: ~$0.18 - $0.30 per call**
 
 **Monthly (1000 calls):**
+
 - ~$200 - $350 + infrastructure costs
 
 ## 🔒 Security Notes
 
 ⚠️ **Important:** This is a development version. Before production:
+
 - Add authentication/authorization
 - Implement rate limiting
 - Add input validation and sanitization
@@ -381,5 +399,4 @@ For issues or questions, please open an issue on GitHub.
 
 ---
 
-Built with ❤️ using OpenAI GPT-4, Deepgram, Twilio, and Next.js
-
+Built with ❤️ using OpenAI GPT-4o Realtime, Twilio, and Next.js

@@ -1,33 +1,59 @@
 "use client";
 
-import { useState } from "react";
 import { useRouter } from "next/navigation";
 import Image from "next/image";
 import { Button } from "@/components/ui/button";
-import { Phone, Clock, CheckCircle } from "lucide-react";
+import { Clock, CheckCircle, Quote } from "lucide-react";
+import Footer from "@/components/Footer";
+import { useAuth } from "@/contexts/AuthContext";
 import { SignInDialog } from "@/components/SignInDialog";
+import { useState } from "react";
 
 export default function Landing() {
   const router = useRouter();
+  const { isAuthenticated, signOut } = useAuth();
   const [signInDialogOpen, setSignInDialogOpen] = useState(false);
   const [logoError, setLogoError] = useState(false);
 
   const handleEnter = () => {
-    router.push("/dashboard");
+    router.push("/home");
   };
+
+  const handleLogoClick = () => {
+    router.push("/");
+  };
+
+  const handleSignOut = async () => {
+    await signOut();
+    router.push("/");
+  };
+
+  const trustedLogos = [
+    "Amazon",
+    "Walmart",
+    "Chase",
+    "Verizon",
+    "Instacart",
+    "Target",
+    "Amazon",
+    "Walmart",
+    "Chase",
+    "Verizon",
+    "Instacart",
+    "Target",
+  ];
 
   return (
     <div className="min-h-screen bg-background relative overflow-hidden">
-      {/* Background Gradient */}
-      <div className="absolute inset-0 bg-gradient-to-br from-blue-50 via-indigo-50 to-purple-50 opacity-40"></div>
-      <div className="absolute inset-0 bg-gradient-to-t from-background via-transparent to-transparent"></div>
+      {/* Subtle Background */}
+      <div className="absolute inset-0 bg-gradient-to-br from-primary/5 via-transparent to-accent/5"></div>
 
       {/* Header */}
       <header className="relative z-10 container max-w-7xl mx-auto px-4 py-6">
         <div className="flex items-center justify-between">
           <div
-            className="flex items-center gap-0 cursor-pointer"
-            onClick={() => router.push("/")}
+            className="cursor-pointer flex-row flex items-center justify-center"
+            onClick={handleLogoClick}
           >
             {logoError ? (
               <div className="w-14 h-14 bg-gradient-to-br from-green-500 to-green-600 rounded-lg flex items-center justify-center text-white font-bold">
@@ -37,87 +63,111 @@ export default function Landing() {
               <div className="w-14 h-14 relative">
                 <Image
                   src="/logo.png"
-                  alt="Holdless Logo"
+                  alt="Holdless logo"
                   fill
-                  className="object-contain"
+                  className="object-contain object-right"
                   priority
                   onError={() => setLogoError(true)}
                 />
               </div>
             )}
-            <span className="text-xl font-bold text-foreground">Holdless</span>
+            <span className="text-xl font-bold tracking-tight text-sidebar-foreground -ml-2">
+              Holdless
+            </span>
           </div>
           <div className="flex items-center gap-3">
-            <Button
-              onClick={() => setSignInDialogOpen(true)}
-              className="px-6 bg-foreground text-background"
-            >
-              Sign In
-            </Button>
+            {isAuthenticated ? (
+              <>
+                <Button
+                  onClick={handleEnter}
+                  variant="ghost"
+                  className="text-muted-foreground hover:text-foreground"
+                >
+                  Dashboard
+                </Button>
+                <Button
+                  onClick={handleSignOut}
+                  className="px-6 bg-[hsl(250_60%_55%)] text-white hover:bg-[hsl(250_60%_50%)] rounded-full"
+                >
+                  Sign Out
+                </Button>
+              </>
+            ) : (
+              <Button
+                onClick={() => setSignInDialogOpen(true)}
+                className="px-6 bg-[hsl(250_60%_55%)] text-white hover:bg-[hsl(250_60%_50%)] rounded-full"
+              >
+                Join or Login
+              </Button>
+            )}
           </div>
         </div>
       </header>
 
       {/* Hero Section */}
-      <main className="relative z-10 container max-w-7xl mx-auto px-4 pt-16 pb-32">
+      <main className="relative z-10 container max-w-7xl mx-auto px-4 pt-20 pb-32">
         <div className="text-center space-y-12">
-          <div className="space-y-8 max-w-5xl mx-auto">
-            <h1 className="text-6xl lg:text-7xl font-bold leading-tight">
+          <div className="space-y-8 max-w-4xl mx-auto">
+            <h1 className="text-5xl md:text-6xl lg:text-7xl font-bold leading-[1.1] tracking-tight">
               <span className="text-foreground">Never wait </span>
-              <span className="bg-gradient-to-r from-blue-600 to-indigo-600 bg-clip-text text-transparent">
+              <span className="text-[#6A3CD9]">
                 on hold
               </span>
               <span className="text-foreground"> again</span>
             </h1>
 
-            <p className="text-xl lg:text-2xl text-muted-foreground leading-relaxed max-w-3xl mx-auto">
-              Discover the new way to handle customer support calls. Your AI
-              assistant manages everything while you focus on what matters.
+            <p className="text-lg md:text-xl text-muted-foreground leading-relaxed max-w-2xl mx-auto">
+              Your AI assistant handles customer support calls while you focus
+              on what matters. No more phone trees, no more waiting.
             </p>
 
-            <div className="flex items-center justify-center gap-6 pt-4">
-              <Button
-                size="lg"
-                onClick={handleEnter}
-                className="px-10 py-6 text-lg bg-foreground text-background hover:bg-foreground/90 shadow-lg"
-              >
-                Get Started Free
-              </Button>
+            <div className="flex items-center justify-center gap-4 pt-4">
+              {isAuthenticated ? (
+                <Button
+                  size="lg"
+                  onClick={handleEnter}
+                  className="px-8 py-6 text-base bg-[hsl(250_60%_55%)] text-white hover:bg-[hsl(250_60%_50%)] rounded-full shadow-lg"
+                >
+                  Enter Dashboard
+                </Button>
+              ) : (
+                <Button
+                  size="lg"
+                  onClick={() => setSignInDialogOpen(true)}
+                  className="px-8 py-6 text-base bg-[hsl(250_60%_55%)] text-white hover:bg-[hsl(250_60%_50%)] rounded-full shadow-lg"
+                >
+                  Get Started Free
+                </Button>
+              )}
             </div>
           </div>
 
           {/* Visual Demo */}
-          <div className="relative max-w-4xl mx-auto mt-16">
-            <div className="absolute inset-0 bg-gradient-to-r from-blue-500/10 to-indigo-500/10 rounded-3xl transform rotate-1"></div>
-            <div className="absolute inset-0 bg-gradient-to-r from-purple-500/10 to-pink-500/10 rounded-3xl transform -rotate-1"></div>
-            <div className="relative bg-card/80 backdrop-blur-sm rounded-3xl p-8 shadow-lg border border-border/50">
-              <div className="space-y-6">
+          <div className="relative max-w-3xl mx-auto mt-20">
+            <div className="relative bg-[hsl(260,27%,96%)] rounded-2xl p-6 md:p-8 shadow-xl border border-border/40">
+              <div className="space-y-5">
                 <div className="flex items-center gap-3">
-                  <div className="w-4 h-4 bg-gradient-to-r from-blue-500 to-indigo-500 rounded-full animate-pulse"></div>
-                  <span className="text-sm text-muted-foreground">
-                    Calling Whole Foods Support...
+                  <div className="w-3 h-3 bg-[#6B46C1] rounded-full animate-pulse"></div>
+                  <span className="text-sm text-foreground font-medium">
+                    Calling Amazon Support...
                   </span>
                 </div>
-                <div className="bg-gradient-to-r from-blue-50 to-indigo-50 rounded-2xl p-6 border-l-4 border-blue-500">
-                  <p className="text-base font-medium text-foreground leading-relaxed">
-                    "Hi, I'm calling as Sarah's authorized assistant regarding
-                    order #113-1234567. We need to request a refund for damaged
-                    strawberries."
+                <div className="bg-[hsl(260,27%,96%)] rounded-xl p-5 border-l-[6px] border-[#6B46C1]">
+                  <p className="text-sm md:text-base text-foreground leading-relaxed">
+                    &quot;Hi, I&apos;m calling as Sarah&apos;s authorized assistant
+                    regarding order #113-1234567. We need to request a refund for
+                    damaged strawberries.&quot;
                   </p>
                 </div>
-                <div className="flex items-center gap-3 text-sm text-muted-foreground">
-                  <Clock className="w-4 h-4" />
-                  <span>On hold: 0:00 (no wait time!)</span>
-                  <div className="flex gap-1 ml-auto">
-                    <div className="w-2 h-2 bg-blue-500 rounded-full animate-bounce"></div>
-                    <div
-                      className="w-2 h-2 bg-blue-500 rounded-full animate-bounce"
-                      style={{ animationDelay: "0.1s" }}
-                    ></div>
-                    <div
-                      className="w-2 h-2 bg-blue-500 rounded-full animate-bounce"
-                      style={{ animationDelay: "0.2s" }}
-                    ></div>
+                <div className="flex items-center justify-between gap-3 text-sm text-foreground">
+                  <div className="flex items-center gap-3">
+                    <Clock className="w-4 h-4" />
+                    <span>On hold: 0:00 (no wait time!)</span>
+                  </div>
+                  <div className="flex gap-1">
+                    <div className="w-2 h-2 bg-[#6B46C1] rounded-full"></div>
+                    <div className="w-2 h-2 bg-[#6B46C1] rounded-full"></div>
+                    <div className="w-2 h-2 bg-[#6B46C1] rounded-full"></div>
                   </div>
                 </div>
               </div>
@@ -128,259 +178,339 @@ export default function Landing() {
 
       {/* Sections */}
       <div className="relative z-10">
-        {/* Trusted By Section */}
-        <section className="relative py-24 md:py-28 bg-muted/30">
+        {/* How It Works Section - Clean Card Layout */}
+        <section className="relative py-24 bg-muted/30">
           <div className="container max-w-7xl mx-auto px-4">
-            <div className="text-center space-y-8">
-              <h3 className="text-sm font-medium text-muted-foreground uppercase tracking-wider">
-                Trusted By
-              </h3>
-              <div className="flex flex-wrap items-center justify-evenly gap-x-8 md:gap-x-12 lg:gap-x-16 gap-y-4 w-full">
-                <span className="text-xl md:text-2xl text-muted-foreground font-bold">
-                  Amazon
-                </span>
-                <span className="text-xl md:text-2xl text-muted-foreground font-bold">
-                  Walmart
-                </span>
-                <span className="text-xl md:text-2xl text-muted-foreground font-bold">
-                  Chase
-                </span>
-                <span className="text-xl md:text-2xl text-muted-foreground font-bold">
-                  Verizon
-                </span>
-                <span className="text-xl md:text-2xl text-muted-foreground font-bold">
-                  Instacart
-                </span>
-                <span className="text-xl md:text-2xl text-muted-foreground font-bold">
-                  Target
-                </span>
-              </div>
-            </div>
-          </div>
-        </section>
-
-        {/* How It Works Section */}
-        <section className="relative pt-32 pb-24 md:pt-40">
-          <div className="container max-w-7xl mx-auto px-4">
-            <div className="text-center space-y-6 mb-20">
-              <h2 className="text-4xl lg:text-5xl font-bold text-foreground max-w-3xl mx-auto leading-tight">
+            <div className="text-center space-y-4 mb-16">
+              <h2 className="text-3xl md:text-4xl lg:text-5xl font-bold text-foreground tracking-tight">
                 How Holdless Works
               </h2>
-              <p className="text-lg text-muted-foreground max-w-2xl mx-auto">
-                From setup to resolution, we've streamlined every step of
-                customer support interactions
+              <p className="text-muted-foreground max-w-xl mx-auto">
+                From Setup To Resolution, We&apos;ve Streamlined Every Step Of
+                Customer Support Interactions.
               </p>
             </div>
 
-            <div className="grid md:grid-cols-3 gap-12 mt-16">
-              <div className="relative">
-                <div className="absolute -top-4 -left-4 w-16 h-16 bg-gradient-to-br from-blue-500 to-blue-600 rounded-2xl flex items-center justify-center text-2xl font-bold text-white shadow-lg">
-                  1
-                </div>
-                <div className="bg-card/80 backdrop-blur-sm rounded-2xl p-8 pt-12 shadow-md border border-border/50 h-full">
-                  <div className="w-14 h-14 bg-blue-100 rounded-xl flex items-center justify-center mb-6">
-                    <Clock className="w-7 h-7 text-blue-600" />
-                  </div>
-                  <h3 className="text-2xl font-semibold text-foreground mb-4">
-                    Create Your Task
-                  </h3>
-                  <p className="text-muted-foreground leading-relaxed mb-4">
-                    Tell us what you need help with. Whether it's a refund
-                    request, account issue, or product inquiry, just describe
-                    your situation.
-                  </p>
-                </div>
+            <div className="grid md:grid-cols-3 gap-6">
+              {/* Card 1 */}
+              <div className="bg-card rounded-2xl p-8 shadow-sm border border-border/40">
+                <h3 className="text-xl font-bold text-foreground mb-4">
+                  Create Your Task
+                </h3>
+                <p className="text-muted-foreground text-sm leading-relaxed mb-6">
+                  Tell us what you need help with in plain English. Whether
+                  it&apos;s a refund request, account issue, or product inquiry,
+                  just describe your situation.
+                </p>
+                <ul className="space-y-3">
+                  <li className="flex items-start gap-3 text-sm text-muted-foreground">
+                    <CheckCircle className="w-4 h-4 text-primary mt-0.5 flex-shrink-0" />
+                    <span>Natural language input - no forms to fill</span>
+                  </li>
+                  <li className="flex items-start gap-3 text-sm text-muted-foreground">
+                    <CheckCircle className="w-4 h-4 text-primary mt-0.5 flex-shrink-0" />
+                    <span>Attach relevant order numbers and details</span>
+                  </li>
+                  <li className="flex items-start gap-3 text-sm text-muted-foreground">
+                    <CheckCircle className="w-4 h-4 text-primary mt-0.5 flex-shrink-0" />
+                    <span>Set priority and preferred outcome</span>
+                  </li>
+                </ul>
               </div>
 
-              <div className="relative">
-                <div className="absolute -top-4 -left-4 w-16 h-16 bg-gradient-to-br from-indigo-500 to-indigo-600 rounded-2xl flex items-center justify-center text-2xl font-bold text-white shadow-lg">
-                  2
-                </div>
-                <div className="bg-card/80 backdrop-blur-sm rounded-2xl p-8 pt-12 shadow-md border border-border/50 h-full">
-                  <div className="w-14 h-14 bg-indigo-100 rounded-xl flex items-center justify-center mb-6">
-                    <Phone className="w-7 h-7 text-indigo-600" />
-                  </div>
-                  <h3 className="text-2xl font-semibold text-foreground mb-4">
-                    AI Takes Over
-                  </h3>
-                  <p className="text-muted-foreground leading-relaxed mb-4">
-                    Your AI assistant calls the company on your behalf,
-                    navigates phone trees, waits on hold, and speaks with
-                    representatives.
-                  </p>
-                </div>
+              {/* Card 2 */}
+              <div className="bg-card rounded-2xl p-8 shadow-sm border border-border/40">
+                <h3 className="text-xl font-bold text-foreground mb-4">
+                  AI Takes Over
+                </h3>
+                <p className="text-muted-foreground text-sm leading-relaxed mb-6">
+                  Your AI assistant calls the company on your behalf, navigates
+                  phone trees, waits on hold, and speaks with representatives
+                  using your authorized instructions.
+                </p>
+                <ul className="space-y-3">
+                  <li className="flex items-start gap-3 text-sm text-muted-foreground">
+                    <CheckCircle className="w-4 h-4 text-primary mt-0.5 flex-shrink-0" />
+                    <span>Handles all wait times automatically</span>
+                  </li>
+                  <li className="flex items-start gap-3 text-sm text-muted-foreground">
+                    <CheckCircle className="w-4 h-4 text-primary mt-0.5 flex-shrink-0" />
+                    <span>Follows your instructions precisely</span>
+                  </li>
+                  <li className="flex items-start gap-3 text-sm text-muted-foreground">
+                    <CheckCircle className="w-4 h-4 text-primary mt-0.5 flex-shrink-0" />
+                    <span>Real-time progress updates in dashboard</span>
+                  </li>
+                </ul>
               </div>
 
-              <div className="relative">
-                <div className="absolute -top-4 -left-4 w-16 h-16 bg-gradient-to-br from-green-500 to-green-600 rounded-2xl flex items-center justify-center text-2xl font-bold text-white shadow-lg">
-                  3
-                </div>
-                <div className="bg-card/80 backdrop-blur-sm rounded-2xl p-8 pt-12 shadow-md border border-border/50 h-full">
-                  <div className="w-14 h-14 bg-green-100 rounded-xl flex items-center justify-center mb-6">
-                    <CheckCircle className="w-7 h-7 text-green-600" />
-                  </div>
-                  <h3 className="text-2xl font-semibold text-foreground mb-4">
-                    Get Results
-                  </h3>
-                  <p className="text-muted-foreground leading-relaxed mb-4">
-                    Review complete call transcripts, confirmation numbers, and
-                    outcomes. Every interaction is documented.
-                  </p>
-                </div>
+              {/* Card 3 */}
+              <div className="bg-card rounded-2xl p-8 shadow-sm border border-border/40">
+                <h3 className="text-xl font-bold text-foreground mb-4">
+                  Get Results
+                </h3>
+                <p className="text-muted-foreground text-sm leading-relaxed mb-6">
+                  Review complete call transcripts, confirmation numbers, and
+                  outcomes. Every interaction is documented with full
+                  transparency and proof of resolution.
+                </p>
+                <ul className="space-y-3">
+                  <li className="flex items-start gap-3 text-sm text-muted-foreground">
+                    <CheckCircle className="w-4 h-4 text-primary mt-0.5 flex-shrink-0" />
+                    <span>Full call transcripts and recordings</span>
+                  </li>
+                  <li className="flex items-start gap-3 text-sm text-muted-foreground">
+                    <CheckCircle className="w-4 h-4 text-primary mt-0.5 flex-shrink-0" />
+                    <span>Confirmation numbers and receipts</span>
+                  </li>
+                  <li className="flex items-start gap-3 text-sm text-muted-foreground">
+                    <CheckCircle className="w-4 h-4 text-primary mt-0.5 flex-shrink-0" />
+                    <span>Track time and money saved</span>
+                  </li>
+                </ul>
               </div>
             </div>
           </div>
         </section>
 
-        {/* Why People Love Holdless Section */}
-        <section className="relative pt-24 pb-32">
-          <div className="container max-w-7xl mx-auto px-4">
-            <div className="text-center space-y-6 mb-20">
-              <h2 className="text-4xl lg:text-5xl font-bold text-foreground max-w-3xl mx-auto leading-tight">
-                Why People Love Holdless
-              </h2>
-              <p className="text-lg text-muted-foreground max-w-2xl mx-auto">
-                Join thousands who have reclaimed their time and eliminated
-                customer support frustration
-              </p>
-            </div>
-
-            <div className="grid md:grid-cols-4 gap-8 mt-16">
-              <div className="text-center">
-                <div className="text-5xl lg:text-6xl font-bold bg-gradient-to-r from-blue-600 to-indigo-600 bg-clip-text text-transparent mb-3">
-                  47hrs
-                </div>
-                <p className="text-muted-foreground text-base">
-                  Average time saved per user annually
-                </p>
-              </div>
-
-              <div className="text-center">
-                <div className="text-5xl lg:text-6xl font-bold bg-gradient-to-r from-blue-600 to-indigo-600 bg-clip-text text-transparent mb-3">
-                  94%
-                </div>
-                <p className="text-muted-foreground text-base">
-                  Success rate on first attempt
-                </p>
-              </div>
-
-              <div className="text-center">
-                <div className="text-5xl lg:text-6xl font-bold bg-gradient-to-r from-blue-600 to-indigo-600 bg-clip-text text-transparent mb-3">
-                  $380
-                </div>
-                <p className="text-muted-foreground text-base">
-                  Average value recovered per user
-                </p>
-              </div>
-
-              <div className="text-center">
-                <div className="text-5xl lg:text-6xl font-bold bg-gradient-to-r from-blue-600 to-indigo-600 bg-clip-text text-transparent mb-3">
-                  24/7
-                </div>
-                <p className="text-muted-foreground text-base">
-                  AI assistant availability
-                </p>
-              </div>
-            </div>
-          </div>
-        </section>
-
-        {/* Perfect For Any Support Need Section */}
+        {/* User Stories Section */}
         <section className="relative py-24">
           <div className="container max-w-7xl mx-auto px-4">
-            <div className="text-center space-y-6 mb-20">
-              <h2 className="text-4xl lg:text-5xl font-bold text-foreground max-w-3xl mx-auto leading-tight">
+            <div className="text-center space-y-4 mb-16">
+              <h2 className="text-3xl md:text-4xl lg:text-5xl font-bold text-foreground tracking-tight">
+                Real People, Real Results
+              </h2>
+              <p className="text-muted-foreground max-w-xl mx-auto">
+                See how Holdless is helping people reclaim their time
+              </p>
+            </div>
+
+            <div className="space-y-16">
+              {/* Story 1 - Image Left */}
+              <div className="grid md:grid-cols-2 gap-12 items-center">
+                <div className="relative">
+                  <div className="aspect-[4/3] rounded-3xl overflow-hidden bg-muted">
+                    <img
+                      src="https://images.unsplash.com/photo-1573496359142-b8d87734a5a2?w=600&h=450&fit=crop"
+                      alt="Sarah M."
+                      className="w-full h-full object-cover"
+                    />
+                  </div>
+                </div>
+                <div className="space-y-6">
+                  <Quote className="w-10 h-10 text-primary/30" />
+                  <p className="text-xl md:text-2xl text-foreground leading-relaxed">
+                    I used to spend hours on hold with my internet provider. Now
+                    I just describe the issue and Holdless handles everything.
+                    Last month I saved over 4 hours.
+                  </p>
+                  <div>
+                    <p className="font-semibold text-foreground">Sarah M.</p>
+                    <p className="text-sm text-muted-foreground">
+                      Small Business Owner, Austin
+                    </p>
+                  </div>
+                </div>
+              </div>
+
+              {/* Story 2 - Image Right */}
+              <div className="grid md:grid-cols-2 gap-12 items-center">
+                <div className="space-y-6 md:order-1">
+                  <Quote className="w-10 h-10 text-primary/30" />
+                  <p className="text-xl md:text-2xl text-foreground leading-relaxed">
+                    The AI got me a $280 refund from a cancelled flight that
+                    I&apos;d given up on. The whole process took 10 minutes of
+                    my time instead of 3 hours.
+                  </p>
+                  <div>
+                    <p className="font-semibold text-foreground">Michael T.</p>
+                    <p className="text-sm text-muted-foreground">
+                      Software Engineer, Seattle
+                    </p>
+                  </div>
+                </div>
+                <div className="relative md:order-2">
+                  <div className="aspect-[4/3] rounded-3xl overflow-hidden bg-muted">
+                    <img
+                      src="https://images.unsplash.com/photo-1472099645785-5658abf4ff4e?w=600&h=450&fit=crop"
+                      alt="Michael T."
+                      className="w-full h-full object-cover"
+                    />
+                  </div>
+                </div>
+              </div>
+
+              {/* Story 3 - Image Left */}
+              <div className="grid md:grid-cols-2 gap-12 items-center">
+                <div className="relative">
+                  <div className="aspect-[4/3] rounded-3xl overflow-hidden bg-muted">
+                    <img
+                      src="https://images.unsplash.com/photo-1580489944761-15a19d654956?w=600&h=450&fit=crop"
+                      alt="Elena R."
+                      className="w-full h-full object-cover"
+                    />
+                  </div>
+                </div>
+                <div className="space-y-6">
+                  <Quote className="w-10 h-10 text-primary/30" />
+                  <p className="text-xl md:text-2xl text-foreground leading-relaxed">
+                    As a busy mom, I don&apos;t have time to wait on hold.
+                    Holdless disputed a wrong charge on my credit card while I
+                    was at my kid&apos;s soccer game. Problem solved.
+                  </p>
+                  <div>
+                    <p className="font-semibold text-foreground">Elena R.</p>
+                    <p className="text-sm text-muted-foreground">
+                      Marketing Manager, Chicago
+                    </p>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        {/* Benefits Section */}
+        <section className="relative py-24 bg-muted/30">
+          <div className="container max-w-7xl mx-auto px-4">
+            <div className="text-center space-y-4 mb-16">
+              <h2 className="text-3xl md:text-4xl lg:text-5xl font-bold text-foreground tracking-tight">
+                Why People Love Holdless
+              </h2>
+              <p className="text-muted-foreground max-w-xl mx-auto">
+                Join thousands who have reclaimed their time
+              </p>
+            </div>
+
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-8">
+              <div className="text-center space-y-2">
+                <div className="text-4xl md:text-5xl font-bold text-foreground">
+                  47hrs
+                </div>
+                <div className="text-sm text-muted-foreground">
+                  Saved per user annually
+                </div>
+              </div>
+              <div className="text-center space-y-2">
+                <div className="text-4xl md:text-5xl font-bold text-foreground">
+                  94%
+                </div>
+                <div className="text-sm text-muted-foreground">
+                  First attempt success
+                </div>
+              </div>
+              <div className="text-center space-y-2">
+                <div className="text-4xl md:text-5xl font-bold text-foreground">
+                  $380
+                </div>
+                <div className="text-sm text-muted-foreground">
+                  Average value recovered
+                </div>
+              </div>
+              <div className="text-center space-y-2">
+                <div className="text-4xl md:text-5xl font-bold text-foreground">
+                  24/7
+                </div>
+                <div className="text-sm text-muted-foreground">
+                  AI availability
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        {/* Use Cases Section */}
+        <section className="relative py-24">
+          <div className="container max-w-7xl mx-auto px-4">
+            <div className="text-center space-y-4 mb-16">
+              <h2 className="text-3xl md:text-4xl lg:text-5xl font-bold text-foreground tracking-tight">
                 Perfect For Any Support Need
               </h2>
             </div>
 
-            <div className="grid md:grid-cols-2 gap-8 mt-16">
-              {/* E-Commerce Issues */}
-              <div className="bg-card/80 backdrop-blur-sm rounded-2xl p-8 shadow-md border border-border/50">
-                <h3 className="text-2xl font-semibold text-foreground mb-4">
+            <div className="grid md:grid-cols-2 gap-6">
+              <div className="bg-card rounded-2xl p-8 shadow-sm border border-border/40 hover:border-border/60 transition-colors">
+                <h3 className="text-lg font-semibold text-foreground mb-3">
                   E-Commerce Issues
                 </h3>
-                <p className="text-muted-foreground leading-relaxed mb-6">
+                <p className="text-muted-foreground text-sm leading-relaxed mb-4">
                   Handle returns, refunds, damaged items, and delivery problems
                   across all your favorite retailers.
                 </p>
-                <div className="flex flex-wrap gap-3">
-                  <span className="px-4 py-2 bg-blue-100 text-blue-700 rounded-lg text-sm font-medium">
+                <div className="flex flex-wrap gap-2">
+                  <span className="text-xs px-3 py-1.5 bg-muted text-muted-foreground rounded-full">
                     Amazon
                   </span>
-                  <span className="px-4 py-2 bg-blue-100 text-blue-700 rounded-lg text-sm font-medium">
+                  <span className="text-xs px-3 py-1.5 bg-muted text-muted-foreground rounded-full">
                     Walmart
                   </span>
-                  <span className="px-4 py-2 bg-blue-100 text-blue-700 rounded-lg text-sm font-medium">
+                  <span className="text-xs px-3 py-1.5 bg-muted text-muted-foreground rounded-full">
                     Target
                   </span>
-                  <span className="px-4 py-2 bg-blue-100 text-blue-700 rounded-lg text-sm font-medium">
+                  <span className="text-xs px-3 py-1.5 bg-muted text-muted-foreground rounded-full">
                     Instacart
                   </span>
                 </div>
               </div>
 
-              {/* Subscription Management */}
-              <div className="bg-card/80 backdrop-blur-sm rounded-2xl p-8 shadow-md border border-border/50">
-                <h3 className="text-2xl font-semibold text-foreground mb-4">
+              <div className="bg-card rounded-2xl p-8 shadow-sm border border-border/40 hover:border-border/60 transition-colors">
+                <h3 className="text-lg font-semibold text-foreground mb-3">
                   Subscription Management
                 </h3>
-                <p className="text-muted-foreground leading-relaxed mb-6">
+                <p className="text-muted-foreground text-sm leading-relaxed mb-4">
                   Cancel unwanted subscriptions, resolve billing disputes, and
                   update payment information effortlessly.
                 </p>
-                <div className="flex flex-wrap gap-3">
-                  <span className="px-4 py-2 bg-purple-100 text-purple-700 rounded-lg text-sm font-medium">
+                <div className="flex flex-wrap gap-2">
+                  <span className="text-xs px-3 py-1.5 bg-muted text-muted-foreground rounded-full">
                     Streaming
                   </span>
-                  <span className="px-4 py-2 bg-purple-100 text-purple-700 rounded-lg text-sm font-medium">
+                  <span className="text-xs px-3 py-1.5 bg-muted text-muted-foreground rounded-full">
                     Software
                   </span>
-                  <span className="px-4 py-2 bg-purple-100 text-purple-700 rounded-lg text-sm font-medium">
+                  <span className="text-xs px-3 py-1.5 bg-muted text-muted-foreground rounded-full">
                     Memberships
                   </span>
                 </div>
               </div>
 
-              {/* Utilities & Services */}
-              <div className="bg-card/80 backdrop-blur-sm rounded-2xl p-8 shadow-md border border-border/50">
-                <h3 className="text-2xl font-semibold text-foreground mb-4">
+              <div className="bg-card rounded-2xl p-8 shadow-sm border border-border/40 hover:border-border/60 transition-colors">
+                <h3 className="text-lg font-semibold text-foreground mb-3">
                   Utilities & Services
                 </h3>
-                <p className="text-muted-foreground leading-relaxed mb-6">
+                <p className="text-muted-foreground text-sm leading-relaxed mb-4">
                   Manage internet, phone, and utility accounts. Resolve service
                   issues and negotiate better rates.
                 </p>
-                <div className="flex flex-wrap gap-3">
-                  <span className="px-4 py-2 bg-blue-100 text-blue-700 rounded-lg text-sm font-medium">
+                <div className="flex flex-wrap gap-2">
+                  <span className="text-xs px-3 py-1.5 bg-muted text-muted-foreground rounded-full">
                     Verizon
                   </span>
-                  <span className="px-4 py-2 bg-blue-100 text-blue-700 rounded-lg text-sm font-medium">
+                  <span className="text-xs px-3 py-1.5 bg-muted text-muted-foreground rounded-full">
                     AT&T
                   </span>
-                  <span className="px-4 py-2 bg-blue-100 text-blue-700 rounded-lg text-sm font-medium">
+                  <span className="text-xs px-3 py-1.5 bg-muted text-muted-foreground rounded-full">
                     Comcast
                   </span>
                 </div>
               </div>
 
-              {/* Financial Services */}
-              <div className="bg-card/80 backdrop-blur-sm rounded-2xl p-8 shadow-md border border-border/50">
-                <h3 className="text-2xl font-semibold text-foreground mb-4">
+              <div className="bg-card rounded-2xl p-8 shadow-sm border border-border/40 hover:border-border/60 transition-colors">
+                <h3 className="text-lg font-semibold text-foreground mb-3">
                   Financial Services
                 </h3>
-                <p className="text-muted-foreground leading-relaxed mb-6">
+                <p className="text-muted-foreground text-sm leading-relaxed mb-4">
                   Dispute charges, request fee waivers, and handle account
                   inquiries with banks and credit card companies.
                 </p>
-                <div className="flex flex-wrap gap-3">
-                  <span className="px-4 py-2 bg-purple-100 text-purple-700 rounded-lg text-sm font-medium">
+                <div className="flex flex-wrap gap-2">
+                  <span className="text-xs px-3 py-1.5 bg-muted text-muted-foreground rounded-full">
                     Chase
                   </span>
-                  <span className="px-4 py-2 bg-purple-100 text-purple-700 rounded-lg text-sm font-medium">
+                  <span className="text-xs px-3 py-1.5 bg-muted text-muted-foreground rounded-full">
                     Bank of America
                   </span>
-                  <span className="px-4 py-2 bg-purple-100 text-purple-700 rounded-lg text-sm font-medium">
+                  <span className="text-xs px-3 py-1.5 bg-muted text-muted-foreground rounded-full">
                     Amex
                   </span>
                 </div>
@@ -388,12 +518,55 @@ export default function Landing() {
             </div>
           </div>
         </section>
+
+        {/* Trusted By Section - Scrolling */}
+        <section className="relative py-16 bg-muted/20 overflow-hidden">
+          <div className="text-center mb-8">
+            <p className="text-sm font-medium text-muted-foreground tracking-wider uppercase">
+              Trusted By
+            </p>
+          </div>
+          <div className="relative">
+            <div className="flex animate-scroll-left w-max">
+              {[...trustedLogos, ...trustedLogos].map((logo, index) => (
+                <div
+                  key={index}
+                  className="flex-shrink-0 mx-12 text-muted-foreground/60 font-semibold text-xl"
+                >
+                  {logo}
+                </div>
+              ))}
+            </div>
+          </div>
+        </section>
+
+        {/* Video Section */}
+        <section className="relative py-24 bg-background">
+          <div className="container max-w-5xl mx-auto px-4">
+            <div className="text-center space-y-4 mb-12">
+              <h2 className="text-3xl md:text-4xl font-bold text-foreground tracking-tight">
+                See Holdless in Action
+              </h2>
+              <p className="text-muted-foreground max-w-xl mx-auto">
+                Watch how our AI handles customer service calls for you
+              </p>
+            </div>
+            <div className="relative aspect-video rounded-2xl overflow-hidden shadow-2xl border border-border/40">
+              <iframe
+                className="absolute inset-0 w-full h-full"
+                src="https://www.youtube.com/embed/H1F35_bPaII"
+                title="Holdless Demo Video"
+                allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+                allowFullScreen
+              />
+            </div>
+          </div>
+        </section>
+
+        <Footer />
       </div>
 
-      <SignInDialog
-        open={signInDialogOpen}
-        onOpenChange={setSignInDialogOpen}
-      />
+      <SignInDialog open={signInDialogOpen} onOpenChange={setSignInDialogOpen} />
     </div>
   );
 }

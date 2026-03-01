@@ -1,6 +1,7 @@
 // Authentication middleware for Express routes
 import { Request, Response, NextFunction } from 'express';
 import { verifyAuthToken } from './supabase';
+import { config } from '../config';
 
 // Extend Express Request type to include user
 declare global {
@@ -66,13 +67,16 @@ export async function authenticateUser(
 
 /**
  * Middleware that requires authentication
- * Returns 401 if user is not authenticated
+ * Returns 401 if user is not authenticated, unless config.auth.allowNoAuth is true (e.g. ALLOW_NO_AUTH=true)
  */
 export function requireAuth(
   req: Request,
   res: Response,
   next: NextFunction
 ): void {
+  if (config.auth.allowNoAuth) {
+    return next();
+  }
   if (!req.user || !req.user.id) {
     res.status(401).json({
       success: false,

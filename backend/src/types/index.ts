@@ -46,6 +46,15 @@ export interface CreateCallRequest {
   purpose: string;
   voice_preference?: VoiceType;
   additional_instructions?: string;
+  /** When set, purpose is generated from slots and quote caller rules are applied */
+  quote_type?: string;
+  quote_slots?: {
+    location?: string | null;
+    procedure?: string | null;
+    pet_age?: string | null;
+    pet_breed?: string | null;
+    pet_weight?: string | null;
+  };
 }
 
 export interface CallResponse {

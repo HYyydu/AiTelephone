@@ -36,6 +36,57 @@ export interface CreateCallRequest {
   purpose: string;
   voice_preference?: VoiceType;
   additional_instructions?: string;
+  quote_type?: string;
+  quote_slots?: QuoteSlots;
+}
+
+// Get-a-quote flow
+export type QuoteStatus =
+  | "collecting_info"
+  | "ready_to_search"
+  | "search_done"
+  | "calling"
+  | "done";
+
+export interface QuoteSlots {
+  location?: string | null;
+  /** Clinic phone number to call directly (alternative to location search) */
+  phone_number?: string | null;
+  procedure?: string | null;
+  pet_age?: string | null;
+  pet_breed?: string | null;
+  pet_weight?: string | null;
+}
+
+export interface QuoteState {
+  quote_type: "vet_clinic";
+  status: QuoteStatus;
+  slots: QuoteSlots;
+  max_clinics_to_call: number;
+  clinics_called: number;
+  updated_at: string;
+}
+
+export interface QuoteValidateResponse {
+  success: boolean;
+  valid: boolean;
+  missingRequired: string[];
+  readyToSearch: boolean;
+}
+
+export interface ClinicSearchResult {
+  id: string;
+  name: string;
+  address: string;
+  phone: string;
+  distance?: string;
+}
+
+export interface QuoteSearchResponse {
+  success: boolean;
+  clinics: ClinicSearchResult[];
+  count: number;
+  location: string;
 }
 
 export interface CallStats {
