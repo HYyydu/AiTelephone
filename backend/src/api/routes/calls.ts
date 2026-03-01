@@ -7,6 +7,9 @@ import { initiateCall } from '../../services/telephony';
 import { validatePhoneNumber, validateCallPurpose, sanitizeInput } from '../../utils/validation';
 import { callCreationLimiter } from '../../utils/rate-limiter';
 import { authenticateUser, requireAuth } from '../../utils/auth-middleware';
+import { config } from '../../config';
+import { generateCallScript } from '../../quote';
+import { QUOTE_CALL_MARKER } from '../../quote/caller-instructions';
 
 const router = Router();
 
@@ -15,13 +18,31 @@ const router = Router();
 // requireAuth ensures user is authenticated (required for user-specific calls)
 router.post('/', authenticateUser, requireAuth, callCreationLimiter, async (req: Request, res: Response) => {
   try {
-    const { phone_number, purpose, voice_preference, additional_instructions }: CreateCallRequest = req.body;
+    const {
+      phone_number,
+      purpose: rawPurpose,
+      voice_preference,
+      additional_instructions: rawAdditional,
+      quote_type,
+      quote_slots,
+    }: CreateCallRequest = req.body;
+
+    let purpose: string;
+    let additional_instructions: string | undefined;
+
+    if (quote_type && quote_slots && typeof quote_slots === 'object') {
+      purpose = generateCallScript(quote_type, quote_slots);
+      additional_instructions = (QUOTE_CALL_MARKER + (rawAdditional ? '\n' + rawAdditional : '')).trim();
+    } else {
+      purpose = rawPurpose ?? '';
+      additional_instructions = rawAdditional;
+    }
 
     // Validation
-    if (!phone_number || !purpose) {
+    if (!phone_number || !purpose.trim()) {
       return res.status(400).json({
         success: false,
-        error: 'Missing required fields: phone_number and purpose are required',
+        error: 'Missing required fields: phone_number and purpose (or quote_type + quote_slots) are required',
       });
     }
 
@@ -43,9 +64,9 @@ router.post('/', authenticateUser, requireAuth, callCreationLimiter, async (req:
       });
     }
 
-    // Get user ID from authenticated request
+    // Get user ID from authenticated request (may be undefined when ALLOW_NO_AUTH=true)
     const userId = req.user?.id;
-    if (!userId) {
+    if (!userId && !config.auth.allowNoAuth) {
       return res.status(401).json({
         success: false,
         error: 'Authentication required to create calls',
@@ -58,13 +79,13 @@ router.post('/', authenticateUser, requireAuth, callCreationLimiter, async (req:
     
     const call: Call = {
       id: uuidv4(),
-      user_id: userId, // Associate call with user
+      user_id: userId,
       phone_number: sanitizeInput(phone_number, 20),
-      purpose: sanitizeInput(purpose, 500),
+      purpose: sanitizeInput(purpose, 2000),
       status: 'queued',
       created_at: new Date(),
       voice_preference: voice_preference || 'professional_female',
-      additional_instructions: additional_instructions ? sanitizeInput(additional_instructions, 500) : undefined,
+      additional_instructions: additional_instructions ? sanitizeInput(additional_instructions, 1000) : undefined,
     };
     
     console.log(`✅ Call created: ${call.id}, user_id: ${call.user_id}`);
@@ -124,7 +145,10 @@ router.get('/', authenticateUser, async (req: Request, res: Response) => {
 // GET /api/calls/:id - Get a specific call (only if it belongs to the authenticated user)
 router.get('/:id', authenticateUser, async (req: Request, res: Response) => {
   try {
-    const { id } = req.params;
+    const id = typeof req.params.id === 'string' ? req.params.id : undefined;
+    if (!id) {
+      return res.status(400).json({ success: false, error: 'Invalid call id' });
+    }
     const userId = req.user?.id;
     
     // Get call, filtering by user_id if user is authenticated
@@ -153,7 +177,10 @@ router.get('/:id', authenticateUser, async (req: Request, res: Response) => {
 // GET /api/calls/:id/transcripts - Get transcripts for a call (only if it belongs to the authenticated user)
 router.get('/:id/transcripts', authenticateUser, async (req: Request, res: Response) => {
   try {
-    const { id } = req.params;
+    const id = typeof req.params.id === 'string' ? req.params.id : undefined;
+    if (!id) {
+      return res.status(400).json({ success: false, error: 'Invalid call id' });
+    }
     const userId = req.user?.id;
     
     // Get call, filtering by user_id if user is authenticated
@@ -203,7 +230,10 @@ router.get('/stats/summary', authenticateUser, async (req: Request, res: Respons
 // DELETE /api/calls/:id - Delete a call (only if it belongs to the authenticated user)
 router.delete('/:id', authenticateUser, requireAuth, async (req: Request, res: Response) => {
   try {
-    const { id } = req.params;
+    const id = typeof req.params.id === 'string' ? req.params.id : undefined;
+    if (!id) {
+      return res.status(400).json({ success: false, error: 'Invalid call id' });
+    }
     const userId = req.user?.id;
     
     // Verify the call belongs to the user before deleting
