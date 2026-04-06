@@ -40,6 +40,7 @@ export const calls = pgTable("calls", {
   call_sid: varchar("call_sid", { length: 255 }),
   to_number: varchar("to_number", { length: 50 }).notNull(),
   purpose: text("purpose").notNull(),
+  name: varchar("name", { length: 100 }), // Name for AI intro: "Hi! My name is {name}. I'm calling..."
   additional_instructions: text("additional_instructions"),
   voice_preference: varchar("voice_preference", { length: 50 }).default("professional_female"),
   status: varchar("status", { length: 50 }).default("pending"),

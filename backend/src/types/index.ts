@@ -4,6 +4,30 @@ export type CallStatus = 'queued' | 'calling' | 'in_progress' | 'completed' | 'f
 
 export type SpeakerType = 'ai' | 'human';
 
+/** In-call realtime conversation state (distinct from DB CallStatus). */
+export type CallConversationState =
+  | 'PRE_ANSWER'
+  | 'ACTIVE_CONVERSATION'
+  | 'ON_HOLD';
+
+/** Why PRE_ANSWER → ACTIVE_CONVERSATION (for logs / future metrics). */
+export type PreAnswerAdvanceReason =
+  | 'realtime_session_ready'
+  | 'first_remote_transcript';
+
+/** Why we entered ON_HOLD — used by CallStateManager and future detectors. */
+export type HoldEnterReason =
+  | 'music_vad'
+  | 'verbal_signal'
+  | 'repeated_announcement';
+
+/** Why we left ON_HOLD. */
+export type HoldExitReason =
+  | 'speech_return'
+  | 'vad_ratio_drop'
+  | 'hold_timeout'
+  | 'manual';
+
 export type VoiceType = 'professional_female' | 'professional_male' | 'friendly_female' | 'friendly_male';
 
 export interface CallConfig {
@@ -20,6 +44,7 @@ export interface Call {
   user_id?: string; // Associate calls with users
   phone_number: string;
   purpose: string;
+  name?: string; // Name the AI uses when introducing itself: "Hi! My name is {name}. I'm calling..."
   status: CallStatus;
   created_at: Date;
   started_at?: Date;
@@ -44,17 +69,9 @@ export interface Transcript {
 export interface CreateCallRequest {
   phone_number: string;
   purpose: string;
+  name?: string; // Optional. Name for the AI to use: "Hi! My name is {name}. I'm calling..."
   voice_preference?: VoiceType;
   additional_instructions?: string;
-  /** When set, purpose is generated from slots and quote caller rules are applied */
-  quote_type?: string;
-  quote_slots?: {
-    location?: string | null;
-    procedure?: string | null;
-    pet_age?: string | null;
-    pet_breed?: string | null;
-    pet_weight?: string | null;
-  };
 }
 
 export interface CallResponse {
@@ -83,6 +100,12 @@ export interface WebSocketEvents {
     call_id: string;
     outcome?: string;
     duration: number;
+    ended_at?: string; // ISO timestamp when call ended (strong signal for frontend)
+  };
+  call_hold_status: {
+    call_id: string;
+    is_on_hold: boolean;
+    conversation_state: CallConversationState;
   };
 }
 

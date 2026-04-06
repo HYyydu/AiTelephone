@@ -66,6 +66,47 @@ export async function authenticateUser(
 }
 
 /**
+ * When CALL_API_TOKEN is set, validates Authorization: Bearer <token> against it and sets req.user.
+ * Otherwise passes through so authenticateUser + requireAuth handle Supabase JWT.
+ */
+export function authenticateCallApiToken(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): void {
+  if (!config.auth.callApiToken) {
+    next();
+    return;
+  }
+
+  const auth = req.headers.authorization;
+
+  if (!auth) {
+    res.status(401).json({
+      success: false,
+      error: "Authentication required",
+    });
+    return;
+  }
+
+  const token = auth.split(" ")[1];
+
+  if (token !== config.auth.callApiToken) {
+    res.status(403).json({
+      success: false,
+      error: "Invalid token",
+    });
+    return;
+  }
+
+  req.user = {
+    id: config.auth.callApiTokenUserId,
+    name: "API",
+  };
+  next();
+}
+
+/**
  * Middleware that requires authentication
  * Returns 401 if user is not authenticated, unless config.auth.allowNoAuth is true (e.g. ALLOW_NO_AUTH=true)
  */
@@ -78,6 +119,7 @@ export function requireAuth(
     return next();
   }
   if (!req.user || !req.user.id) {
+    console.log("HEADERS:", req.headers);
     res.status(401).json({
       success: false,
       error: 'Authentication required',

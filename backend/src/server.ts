@@ -248,6 +248,12 @@ app.use((req, res, next) => {
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+// Log every incoming request (so you can see when calls hit the backend)
+app.use((req: Request, _res: Response, next: Function) => {
+  console.log(`📥 ${req.method} ${req.path}`);
+  next();
+});
+
 // Import rate limiters
 import { apiLimiter } from "./utils/rate-limiter";
 app.use("/api/", apiLimiter);
@@ -289,7 +295,7 @@ io.on("connection", (socket) => {
     console.log(`❌ Client disconnected: ${socket.id}`);
   });
 
-  socket.on("join_call", (payload: string | { callId?: string; call_id?: string }) => {
+  socket.on("join_call", async (payload: string | { callId?: string; call_id?: string }) => {
     const callId = typeof payload === "string" ? payload : payload?.callId ?? payload?.call_id ?? "";
     if (!callId) {
       console.warn(`📞 Client ${socket.id} join_call missing call id:`, payload);
@@ -297,6 +303,30 @@ io.on("connection", (socket) => {
     }
     socket.join(`call:${callId}`);
     console.log(`📞 Client ${socket.id} joined call room: ${callId}`);
+
+    // If call already ended, send call_ended immediately so frontend gets a strong signal (e.g. after reconnect)
+    try {
+      const call = await CallService.getCall(callId);
+      if (
+        call &&
+        (call.status === "completed" || call.status === "failed") &&
+        call.ended_at
+      ) {
+        const endedAt =
+          call.ended_at instanceof Date ? call.ended_at.toISOString() : call.ended_at;
+        socket.emit("call_ended", {
+          call_id: call.id,
+          outcome: call.outcome,
+          duration: call.duration_seconds ?? 0,
+          ended_at: endedAt,
+        });
+        console.log(
+          `📴 Call already ended: sent call_ended to client ${socket.id} for call ${callId}`
+        );
+      }
+    } catch (err) {
+      console.warn(`⚠️ Could not send call_ended on join for ${callId}:`, err);
+    }
   });
 
   socket.on("leave_call", (payload: string | { callId?: string; call_id?: string }) => {

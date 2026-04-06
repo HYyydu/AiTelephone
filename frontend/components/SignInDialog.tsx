@@ -41,7 +41,7 @@ export function SignInDialog({ open, onOpenChange }: SignInDialogProps) {
     try {
       await signIn(email, password);
       onOpenChange(false);
-      router.push('/dashboard');
+      router.push('/start');
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to sign in');
     } finally {
@@ -57,7 +57,7 @@ export function SignInDialog({ open, onOpenChange }: SignInDialogProps) {
     try {
       await signUp(name, email, password);
       onOpenChange(false);
-      router.push('/dashboard');
+      router.push('/start');
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to create account');
     } finally {
@@ -105,7 +105,7 @@ export function SignInDialog({ open, onOpenChange }: SignInDialogProps) {
       const response = await api.verifyPhoneOTP(formattedPhone, otp);
       if (response.success && response.user) {
         onOpenChange(false);
-        router.push('/dashboard');
+        router.push('/start');
       } else {
         setError(response.error || 'Failed to verify OTP');
       }

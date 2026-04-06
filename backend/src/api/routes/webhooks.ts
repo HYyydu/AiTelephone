@@ -143,10 +143,11 @@ router.get("/twilio/voice", (req: Request, res: Response) => {
 // POST /api/webhooks/twilio/status - Handle call status updates from Twilio
 router.post("/twilio/status", async (req: Request, res: Response) => {
   try {
-    const { CallSid, CallStatus, CallDuration, RecordingUrl } = req.body;
+    const { CallSid, CallStatus, CallDuration, RecordingUrl, To, From } =
+      req.body;
 
     console.log(
-      `📞 Twilio status webhook - CallSid: ${CallSid}, Status: ${CallStatus}`
+      `📞 Twilio status webhook - CallSid: ${CallSid}, Status: ${CallStatus}, To: ${To ?? "?"}, From: ${From ?? "?"}`
     );
 
     // Find the call by Twilio SID (optimized query)
@@ -229,19 +230,26 @@ router.post("/twilio/status", async (req: Request, res: Response) => {
 
     await CallService.updateCall(call.id, updates);
 
-    // Emit WebSocket event
+    // Emit WebSocket event so frontend gets live status
     io.to(`call:${call.id}`).emit("call_status", {
       call_id: call.id,
       status,
       duration: updates.duration_seconds,
     });
 
+    // Strong signal: emit call_ended when call is completed or failed (e.g. user hung up)
     if (status === "completed" || status === "failed") {
-      io.to(`call:${call.id}`).emit("call_ended", {
+      const endedAt = updates.ended_at ?? new Date();
+      const payload = {
         call_id: call.id,
         outcome: call.outcome,
-        duration: updates.duration_seconds || 0,
-      });
+        duration: updates.duration_seconds ?? 0,
+        ended_at: endedAt instanceof Date ? endedAt.toISOString() : endedAt,
+      };
+      io.to(`call:${call.id}`).emit("call_ended", payload);
+      console.log(
+        `📴 Call ended signal sent to frontend | call_id: ${call.id} | status: ${status} | duration: ${payload.duration}s`
+      );
     }
 
     res.status(200).send("OK");

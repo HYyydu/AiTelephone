@@ -36,8 +36,6 @@ export interface CreateCallRequest {
   purpose: string;
   voice_preference?: VoiceType;
   additional_instructions?: string;
-  quote_type?: string;
-  quote_slots?: QuoteSlots;
 }
 
 // Get-a-quote flow

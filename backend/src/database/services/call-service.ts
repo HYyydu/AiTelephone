@@ -13,6 +13,7 @@ function dbCallToCall(dbCall: typeof calls.$inferSelect): Call {
     user_id: dbCall.user_id || undefined,
     phone_number: dbCall.to_number, // Map to_number -> phone_number
     purpose: dbCall.purpose,
+    name: dbCall.name || undefined,
     status: dbCall.status as CallStatus,
     created_at: dbCall.created_at || new Date(),
     started_at: dbCall.started_at || undefined,
@@ -35,6 +36,7 @@ function callToDbCall(call: Call): typeof calls.$inferInsert {
     user_id: call.user_id || null,
     to_number: call.phone_number, // Map phone_number -> to_number
     purpose: call.purpose,
+    name: call.name || null,
     status: call.status,
     created_at: call.created_at,
     started_at: call.started_at || null,

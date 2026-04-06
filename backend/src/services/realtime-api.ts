@@ -263,6 +263,25 @@ export class RealtimeAPIConnection {
   }
 
   /**
+   * Request a one-off spoken response (e.g. idle check) without user input in context.
+   */
+  requestResponseWithInstructions(instructions: string) {
+    if (!this.ws || !this.isConnected) {
+      return false;
+    }
+
+    this.send({
+      type: "response.create",
+      response: {
+        modalities: ["audio", "text"],
+        instructions,
+      },
+    });
+
+    return true;
+  }
+
+  /**
    * Cancel current response
    */
   cancelResponse() {

@@ -458,15 +458,18 @@ function ChatPageContent() {
 
   const handleCallThisNumber = async () => {
     const phone = quoteState?.slots?.phone_number?.trim();
-    if (!phone || !quoteType || quoteCallSubmitting) return;
+    if (!phone || !quoteType || !quoteState || quoteCallSubmitting) return;
     setQuoteCallSubmitting(true);
     setCallStubMessage(null);
     try {
+      const { script } = await api.getQuoteScript(quoteType, quoteState.slots);
+      if (!script?.trim()) {
+        setCallStubMessage("Could not generate call script.");
+        return;
+      }
       await api.createCall({
         phone_number: phone,
-        purpose: "Quote call",
-        quote_type: quoteType,
-        quote_slots: quoteState!.slots,
+        purpose: script,
       });
       setCallStubMessage("Call started. You can track it from the dashboard.");
       setTimeout(() => router.push("/dashboard"), 1500);
@@ -485,11 +488,14 @@ function ChatPageContent() {
     if (!phone || !quoteState || !quoteType || quoteCallSubmitting) return;
     setQuoteCallSubmitting(true);
     try {
+      const { script } = await api.getQuoteScript(quoteType, quoteState.slots);
+      if (!script?.trim()) {
+        setValidateResult?.({ success: false, valid: false, missingRequired: [], readyToSearch: false });
+        return;
+      }
       await api.createCall({
         phone_number: quoteCallPhone.trim(),
-        purpose: "Quote call", // backend overwrites with generated script when quote_slots provided
-        quote_type: quoteType,
-        quote_slots: quoteState.slots,
+        purpose: script,
       });
       setQuoteCallPhone("");
       setValidateResult(null);

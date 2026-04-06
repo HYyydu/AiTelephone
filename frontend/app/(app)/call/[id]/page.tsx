@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo, useCallback } from "react";
 import { useParams, useRouter } from "next/navigation";
 import Link from "next/link";
 import { Button } from "@/components/ui/button";
@@ -9,7 +9,7 @@ import { CallStatusBadge } from "@/components/CallStatusBadge";
 import { TranscriptView } from "@/components/TranscriptView";
 import { Call, Transcript, CallStatus } from "@/lib/types";
 import { api } from "@/lib/api";
-import { wsClient } from "@/lib/websocket";
+import { wsClient, getWsDisplayUrl } from "@/lib/websocket";
 import {
   ArrowLeft,
   Download,
@@ -20,6 +20,7 @@ import {
   WifiOff,
   AlertCircle,
   RefreshCw,
+  PhoneOff,
 } from "lucide-react";
 import { formatDistanceToNow } from "date-fns";
 import { MissingInformationForm } from "@/components/MissingInformationForm";
@@ -37,6 +38,46 @@ export default function CallDetailPage() {
   const [wsState, setWsState] = useState<
     "disconnected" | "connecting" | "connected" | "reconnecting" | "error"
   >("disconnected");
+  const [isOnHold, setIsOnHold] = useState(false);
+  const [conversationState, setConversationState] = useState<
+    "PRE_ANSWER" | "ACTIVE_CONVERSATION" | "ON_HOLD"
+  >("PRE_ANSWER");
+  // Strong signal: set when we receive call_ended from backend (e.g. user hung up); used to show "Call ended" feedback
+  const [callEndedSignalAt, setCallEndedSignalAt] = useState<number | null>(
+    null
+  );
+
+  // Drop consecutive duplicate messages (same speaker + same text) for display only
+  const transcriptsDeduped = useMemo(() => {
+    return transcripts.filter((t, i) => {
+      const prev = transcripts[i - 1];
+      if (!prev) return true;
+      return (
+        prev.speaker !== t.speaker ||
+        prev.message.trim() !== t.message.trim()
+      );
+    });
+  }, [transcripts]);
+
+  /** DB is source of truth if Socket.IO misses call_ended (e.g. client disconnects first). */
+  const refreshCallStatus = useCallback(async () => {
+    if (!callId) return;
+    try {
+      const { call: fresh } = await api.getCall(callId);
+      setCall((prev) => {
+        if (!prev || !fresh) return prev;
+        return {
+          ...prev,
+          status: fresh.status,
+          duration_seconds: fresh.duration_seconds ?? prev.duration_seconds,
+          outcome: fresh.outcome ?? prev.outcome,
+          ended_at: fresh.ended_at ?? prev.ended_at,
+        };
+      });
+    } catch {
+      /* offline / transient */
+    }
+  }, [callId]);
 
   useEffect(() => {
     if (!callId) return;
@@ -47,11 +88,16 @@ export default function CallDetailPage() {
     const handleTranscript = (transcript: Transcript) => {
       if (transcript.call_id === callId) {
         setTranscripts((prev) => {
-          // Check if transcript already exists to prevent duplicates
-          const exists = prev.some((t) => t.id === transcript.id);
-          if (exists) {
-            return prev;
-          }
+          // Check if transcript already exists by id (same event)
+          const existsById = prev.some((t) => t.id === transcript.id);
+          if (existsById) return prev;
+          // Check if we already have the same speaker + message (duplicate content, different id)
+          const sameContent = prev.some(
+            (t) =>
+              t.speaker === transcript.speaker &&
+              t.message.trim() === transcript.message.trim()
+          );
+          if (sameContent) return prev;
           return [...prev, transcript];
         });
       }
@@ -75,6 +121,7 @@ export default function CallDetailPage() {
       call_id: string;
       outcome?: string;
       duration: number;
+      ended_at?: string;
     }) => {
       if (data.call_id === callId) {
         setCall((prev) =>
@@ -84,9 +131,26 @@ export default function CallDetailPage() {
                 status: "completed",
                 outcome: data.outcome,
                 duration_seconds: data.duration,
+                ...(data.ended_at ? { ended_at: data.ended_at } : {}),
               }
             : null
         );
+        // Strong signal: show "Call ended" feedback to user (e.g. after hanging up)
+        setCallEndedSignalAt(Date.now());
+      }
+    };
+
+    const handleCallHoldStatus = (data: {
+      call_id: string;
+      is_on_hold: boolean;
+      conversation_state:
+        | "PRE_ANSWER"
+        | "ACTIVE_CONVERSATION"
+        | "ON_HOLD";
+    }) => {
+      if (data.call_id === callId) {
+        setIsOnHold(data.is_on_hold);
+        setConversationState(data.conversation_state);
       }
     };
 
@@ -107,6 +171,7 @@ export default function CallDetailPage() {
     wsClient.onTranscript(handleTranscript);
     wsClient.onCallStatus(handleCallStatus);
     wsClient.onCallEnded(handleCallEnded);
+    wsClient.onCallHoldStatus(handleCallHoldStatus);
 
     // Join call room - will queue if not connected yet
     wsClient.joinCall(callId);
@@ -116,11 +181,13 @@ export default function CallDetailPage() {
       console.log(`✅ WebSocket connected, joining call: ${callId}`);
       setWsConnected(true);
       wsClient.joinCall(callId);
+      void refreshCallStatus();
     };
 
     const onDisconnect = () => {
       console.log(`❌ WebSocket disconnected`);
       setWsConnected(false);
+      void refreshCallStatus();
     };
 
     if (socket.connected) {
@@ -140,10 +207,38 @@ export default function CallDetailPage() {
       wsClient.off("transcript", handleTranscript);
       wsClient.off("call_status", handleCallStatus);
       wsClient.off("call_ended", handleCallEnded);
+      wsClient.off("call_hold_status", handleCallHoldStatus);
       unsubscribeState();
       wsClient.leaveCall(callId);
     };
-  }, [callId]);
+  }, [callId, refreshCallStatus]);
+
+  // While Twilio still shows the call as live in the DB, poll — fixes "stuck" Live badge after missed WS events
+  useEffect(() => {
+    if (!callId || !call) return;
+    if (call.status !== "in_progress" && call.status !== "calling") return;
+
+    const id = setInterval(() => {
+      void refreshCallStatus();
+    }, 8000);
+
+    const onVis = () => {
+      if (document.visibilityState === "visible") void refreshCallStatus();
+    };
+    document.addEventListener("visibilitychange", onVis);
+
+    return () => {
+      clearInterval(id);
+      document.removeEventListener("visibilitychange", onVis);
+    };
+  }, [callId, call?.status, refreshCallStatus]);
+
+  // Auto-hide "Call ended" banner after 5 seconds
+  useEffect(() => {
+    if (callEndedSignalAt === null) return;
+    const t = setTimeout(() => setCallEndedSignalAt(null), 5000);
+    return () => clearTimeout(t);
+  }, [callEndedSignalAt]);
 
   async function loadCallData() {
     try {
@@ -206,10 +301,10 @@ export default function CallDetailPage() {
         <Card className="max-w-md">
           <CardContent className="p-6">
             <p className="text-red-600 mb-4">❌ {error || "Call not found"}</p>
-            <Link href="/dashboard">
+            <Link href="/start">
               <Button>
                 <ArrowLeft className="mr-2 h-4 w-4" />
-                Back to Dashboard
+                Start another call
               </Button>
             </Link>
           </CardContent>
@@ -258,13 +353,30 @@ export default function CallDetailPage() {
       <div className="container mx-auto px-4 py-8 max-w-6xl">
         {/* Header */}
         <div className="mb-6">
-          <Link href="/dashboard">
-            <Button variant="ghost" size="sm">
-              <ArrowLeft className="mr-2 h-4 w-4" />
-              Back to Dashboard
-            </Button>
-          </Link>
+            <Link href="/start">
+              <Button variant="ghost" size="sm">
+                <ArrowLeft className="mr-2 h-4 w-4" />
+                Start another call
+              </Button>
+            </Link>
         </div>
+
+        {/* Call ended signal — strong feedback when user hangs up */}
+        {callEndedSignalAt !== null && (
+          <Card className="mb-6 border-green-200 bg-green-50 shadow-md">
+            <CardContent className="py-4">
+              <div className="flex items-center gap-3 text-green-800">
+                <PhoneOff className="h-6 w-6 text-green-600" />
+                <div>
+                  <p className="font-semibold">Call ended</p>
+                  <p className="text-sm text-green-700">
+                    The call has ended. Summary and transcript are below.
+                  </p>
+                </div>
+              </div>
+            </CardContent>
+          </Card>
+        )}
 
         {/* Missing Information Form */}
         {needsFollowUp && (
@@ -272,6 +384,41 @@ export default function CallDetailPage() {
             call={call}
             missingInfo={missingInformation}
           />
+        )}
+
+        {/* Pre-answer: IVR / queue before live conversation phase (see CALL_PRE_ANSWER_ADVANCE_MODE) */}
+        {conversationState === "PRE_ANSWER" && isLive && !isOnHold && (
+          <Card className="mb-6 border-sky-200 bg-sky-50 shadow-md">
+            <CardContent className="py-4">
+              <div className="flex items-center gap-3 text-sky-900">
+                <Phone className="h-6 w-6 text-sky-600" />
+                <div>
+                  <p className="font-semibold">Connecting</p>
+                  <p className="text-sm text-sky-800">
+                    Waiting on menu, ring, or queue (pre-answer). Conversation phase starts when the
+                    session advances per server settings.
+                  </p>
+                </div>
+              </div>
+            </CardContent>
+          </Card>
+        )}
+
+        {/* Music Hold Signal */}
+        {isOnHold && isLive && (
+          <Card className="mb-6 border-amber-200 bg-amber-50 shadow-md animate-pulse">
+            <CardContent className="py-4">
+              <div className="flex items-center gap-3 text-amber-800">
+                <Clock className="h-6 w-6 text-amber-600" />
+                <div>
+                  <p className="font-semibold">Call is on hold</p>
+                  <p className="text-sm text-amber-700">
+                    Hold music detected. Audio to AI is paused to save tokens, waiting for speech to return...
+                  </p>
+                </div>
+              </div>
+            </CardContent>
+          </Card>
         )}
 
         {/* Connection Error Alert */}
@@ -490,14 +637,36 @@ export default function CallDetailPage() {
           </CardHeader>
           <CardContent>
             {isLive && !wsConnected && (
-              <div className="mb-4 p-3 bg-yellow-50 border border-yellow-200 rounded-lg">
+              <div className="mb-4 p-3 bg-yellow-50 border border-yellow-200 rounded-lg space-y-2">
                 <p className="text-sm text-yellow-800">
                   ⚠️ WebSocket not connected. Transcripts may not appear in
-                  real-time. Check browser console for connection errors.
+                  real-time.
                 </p>
+                <p className="text-xs text-yellow-700 font-mono break-all">
+                  Connecting to: {getWsDisplayUrl()}
+                </p>
+                <p className="text-xs text-yellow-700">
+                  Ensure the backend is running and{" "}
+                  <code className="bg-yellow-100 px-1 rounded">
+                    NEXT_PUBLIC_WS_URL
+                  </code>{" "}
+                  in <code className="bg-yellow-100 px-1 rounded">.env.local</code> matches it. Check the browser console for errors.
+                </p>
+                <Button
+                  onClick={() => wsClient.reconnect()}
+                  variant="outline"
+                  size="sm"
+                  className="mt-2 border-yellow-300 text-yellow-800 hover:bg-yellow-100"
+                >
+                  <RefreshCw className="h-3 w-3 mr-1" />
+                  Retry connection
+                </Button>
               </div>
             )}
-            <TranscriptView transcripts={transcripts} isLive={isLive} />
+            <TranscriptView
+              transcripts={transcriptsDeduped}
+              isLive={isLive}
+            />
           </CardContent>
         </Card>
       </div>

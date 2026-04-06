@@ -6,6 +6,29 @@ import { CallService } from '../database/services/call-service';
 
 const twilioClient = twilio(config.twilio.accountSid, config.twilio.authToken);
 
+/** Twilio returns 21205 for localhost; fail early with a clear message. */
+function assertPublicWebhookBase(baseUrl: string): void {
+  let hostname: string;
+  try {
+    hostname = new URL(baseUrl).hostname;
+  } catch {
+    throw new Error(
+      `Invalid PUBLIC_URL "${baseUrl}". Use a full URL like https://your-tunnel.example.com`,
+    );
+  }
+  if (
+    hostname === "localhost" ||
+    hostname === "127.0.0.1" ||
+    hostname === "[::1]" ||
+    hostname.endsWith(".local")
+  ) {
+    throw new Error(
+      `Twilio cannot use webhook URL ${baseUrl} (localhost is not reachable from the internet). ` +
+        `Expose your backend with ngrok, Cloudflare Tunnel, etc., then set PUBLIC_URL to that HTTPS origin (no trailing slash).`,
+    );
+  }
+}
+
 export async function initiateCall(call: Call): Promise<void> {
   try {
     console.log(`📞 Initiating call to ${call.phone_number} for purpose: ${call.purpose}`);
@@ -13,18 +36,13 @@ export async function initiateCall(call: Call): Promise<void> {
     // Update call status
     await CallService.updateCall(call.id, { status: 'calling' });
 
-    // Determine the webhook URL (you'll need to expose this publicly with ngrok for development)
-    const baseUrl = process.env.PUBLIC_URL || 'http://localhost:3001';
+    // Webhooks must be public HTTPS (or at least non-localhost); use ngrok / tunnel in dev.
+    const baseUrl = (process.env.PUBLIC_URL || "http://localhost:3001").replace(/\/$/, "");
+    assertPublicWebhookBase(baseUrl);
     const statusCallbackUrl = `${baseUrl}/api/webhooks/twilio/status`;
     const voiceUrl = `${baseUrl}/api/webhooks/twilio/voice`;
 
     console.log(`📞 Using voice webhook URL: ${voiceUrl}`);
-    
-    if (!process.env.PUBLIC_URL) {
-      console.warn('⚠️  WARNING: PUBLIC_URL not set! Twilio cannot reach localhost.');
-      console.warn('⚠️  Please add PUBLIC_URL to your .env file with your ngrok URL');
-      console.warn('⚠️  Example: PUBLIC_URL=https://your-ngrok-url.ngrok-free.app');
-    }
 
     // Make the call using Twilio
     const twilioCall = await twilioClient.calls.create({

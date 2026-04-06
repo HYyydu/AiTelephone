@@ -94,7 +94,7 @@ So: **backend = Express REST API; frontend = HTTP client (api.ts) with auth.**
 |----------------|-------------------------------|---------|------|
 | `transcript`   | `gpt4o-realtime-handler.ts`   | `Transcript` | Each new transcript line (AI or human) |
 | `call_status`  | `webhooks.ts` (Twilio status) | `{ call_id, status, duration? }` | Twilio reports status (e.g. ringing, in-progress, completed) |
-| `call_ended`   | `webhooks.ts` (Twilio status) | `{ call_id, outcome?, duration }` | When Twilio says the call ended |
+| `call_ended`   | `webhooks.ts` (Twilio status) | `{ call_id, outcome?, duration, ended_at? }` | When the call is completed or failed (e.g. user hung up). Strong signal for “Call ended” in UI. |
 
 **Emit targets:**
 

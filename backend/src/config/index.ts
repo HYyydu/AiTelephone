@@ -114,11 +114,116 @@ export const config = {
   call: {
     maxDurationMinutes: 15,
     recordCalls: true,
+    /** Max time in ON_HOLD before auto-resuming audio to GPT (0 = no timeout). */
+    holdTimeoutMs: parseInt(process.env.CALL_HOLD_TIMEOUT_MS || "600000", 10),
+    /**
+     * PRE_ANSWER → ACTIVE_CONVERSATION.
+     * `immediate` = after Realtime session is configured (default; same effective timing as pre-phases).
+     * `first_remote_transcript` = first far-end transcript passing length + quality gates (IVR/menu phase until then).
+     */
+    preAnswerAdvanceMode:
+      process.env.CALL_PRE_ANSWER_ADVANCE_MODE === "first_remote_transcript"
+        ? ("first_remote_transcript" as const)
+        : ("immediate" as const),
+    /** Phase 4: require spectral flatness (plus energy) for music hold; set false for energy-only. */
+    holdFlatnessEnabled: process.env.HOLD_FLATNESS_ENABLED !== "false",
+    /** Mean flatness ≥ this → broadband / noise-like hold (typical muzak). */
+    holdFlatnessMinMean: parseFloat(
+      process.env.HOLD_FLATNESS_MIN_MEAN || "0.09",
+    ),
+    /** Mean flatness ≤ this with high active ratio → tonal loop (optional second cue). */
+    holdFlatnessTonalMax: parseFloat(
+      process.env.HOLD_FLATNESS_TONAL_MAX || "0.065",
+    ),
+    /** Phase 5: same IVR line repeated → ON_HOLD. */
+    holdRepeatEnabled: process.env.HOLD_REPEAT_ENABLED !== "false",
+    holdRepeatMinChars: parseInt(process.env.HOLD_REPEAT_MIN_CHARS || "24", 10),
+    holdRepeatWindow: parseInt(process.env.HOLD_REPEAT_WINDOW || "8", 10),
+    /** 1 = exact normalized match only; 0.85 = word Jaccard ≥ 0.85 vs any item in window. */
+    holdRepeatSimilarity: parseFloat(
+      process.env.HOLD_REPEAT_SIMILARITY || "1",
+    ),
+    /**
+     * Agent-initiated hang-up after prolonged user silence (Twilio end).
+     * Opt-in via CALL_IDLE_HANGUP_ENABLED=true — conservative defaults.
+     */
+    /**
+     * Auto-send DTMF when transcripts look like IVR menus and a digit aligns with call purpose.
+     * Disable with IVR_DTMF_ENABLED=false.
+     */
+    ivrDtmf: (() => {
+      const rawDelay = parseInt(
+        process.env.IVR_DTMF_DELAY_MS || "2000",
+        10,
+      );
+      /** Values under ~1.5s routinely fire during prompt audio → IVR ignores DTMF. */
+      const minPostPrompt = 1600;
+      const maxPostPrompt = 10000;
+      const postPromptDelayMs = Number.isFinite(rawDelay)
+        ? Math.min(maxPostPrompt, Math.max(minPostPrompt, rawDelay))
+        : 2000;
+      if (
+        process.env.IVR_DTMF_DELAY_MS &&
+        Number.isFinite(rawDelay) &&
+        rawDelay !== postPromptDelayMs
+      ) {
+        console.warn(
+          `[config] IVR_DTMF_DELAY_MS=${rawDelay} clamped to ${postPromptDelayMs}ms (safe range ${minPostPrompt}–${maxPostPrompt}).`,
+        );
+      }
+      let preDtmfPause = (process.env.IVR_DTMF_PRE_PAUSE || "www").replace(
+        /[^w]/gi,
+        "",
+      );
+      if (!preDtmfPause) preDtmfPause = "www";
+      /** At least 1.5s lead-in before the digit (Twilio: each w = 0.5s). */
+      if (preDtmfPause.length < 3) preDtmfPause = "www";
+
+      return {
+        enabled: process.env.IVR_DTMF_ENABLED !== "false",
+        postPromptDelayMs,
+        cooldownMs: parseInt(process.env.IVR_DTMF_COOLDOWN_MS || "4500", 10),
+        minScore: parseFloat(process.env.IVR_DTMF_MIN_SCORE || "0.28"),
+        minMargin: parseFloat(process.env.IVR_DTMF_MIN_MARGIN || "0.1"),
+        preDtmfPause,
+        /**
+         * If call purpose + instructions tokenize to nothing, IVR matching cannot score options.
+         * Default bias (e.g. leasing) for property-style trees. Override with IVR_DTMF_FALLBACK_PURPOSE.
+         */
+        fallbackPurposeWhenEmpty: (
+          process.env.IVR_DTMF_FALLBACK_PURPOSE || "leasing"
+        ).trim(),
+      };
+    })(),
+    idleHangup: {
+      enabled: process.env.CALL_IDLE_HANGUP_ENABLED === "true",
+      /** User quiet this long before "Are you still there?" (ms). */
+      idleMsBeforePing: parseInt(
+        process.env.CALL_IDLE_MS_BEFORE_PING || "75000",
+        10,
+      ),
+      /** Silence after ping audio completes before hanging up (ms). */
+      silenceMsAfterPing: parseInt(
+        process.env.CALL_SILENCE_MS_AFTER_IDLE_PING || "20000",
+        10,
+      ),
+      /** No ping/hang-up until call is at least this old (ms). */
+      minCallAgeMs: parseInt(
+        process.env.CALL_IDLE_MIN_CALL_AGE_MS || "45000",
+        10,
+      ),
+    },
   },
 
   // Auth: when true, requireAuth middleware allows unauthenticated requests (dev/testing only)
   auth: {
     allowNoAuth: process.env.ALLOW_NO_AUTH === "true",
+    /** If set, POST /api/calls accepts this Bearer token (server-to-server) instead of Supabase JWT only. */
+    callApiToken: process.env.CALL_API_TOKEN || "",
+    /** Optional UUID stored on calls created via CALL_API_TOKEN (defaults to a fixed placeholder). */
+    callApiTokenUserId:
+      process.env.CALL_API_TOKEN_USER_ID ||
+      "00000000-0000-4000-8000-000000000001",
   },
 };
 
@@ -184,6 +289,12 @@ export function validateConfig() {
   if (process.env.ALLOW_NO_AUTH === "true") {
     console.warn(
       "⚠️  ALLOW_NO_AUTH=true: unauthenticated requests are allowed (dev/testing only; do not use in production)",
+    );
+  }
+
+  if (process.env.CALL_IDLE_HANGUP_ENABLED === "true") {
+    console.log(
+      "📞 CALL_IDLE_HANGUP_ENABLED=true: agent may end Twilio call after idle ping + silence",
     );
   }
 }

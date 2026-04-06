@@ -36,6 +36,13 @@ function getWebSocketUrl(): string {
 
 const WS_URL = getWebSocketUrl();
 
+/** Public URL used for connection (for display in UI). */
+export function getWsDisplayUrl(): string {
+  return typeof window !== "undefined"
+    ? getWebSocketUrl()
+    : process.env.NEXT_PUBLIC_WS_URL || "http://localhost:3001";
+}
+
 class WebSocketClient {
   private socket: Socket | null = null;
   private pendingCallId: string | null = null;
@@ -454,10 +461,25 @@ class WebSocketClient {
       call_id: string;
       outcome?: string;
       duration: number;
+      ended_at?: string;
     }) => void,
   ) {
     const socket = this.socket || this.connect();
     socket.on("call_ended", callback);
+  }
+
+  onCallHoldStatus(
+    callback: (data: {
+      call_id: string;
+      is_on_hold: boolean;
+      conversation_state:
+        | "PRE_ANSWER"
+        | "ACTIVE_CONVERSATION"
+        | "ON_HOLD";
+    }) => void,
+  ) {
+    const socket = this.socket || this.connect();
+    socket.on("call_hold_status", callback);
   }
 
   off(event: string, callback?: (...args: any[]) => void) {

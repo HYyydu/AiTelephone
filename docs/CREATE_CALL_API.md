@@ -50,16 +50,18 @@ The backend expects **snake_case** and uses `purpose` (not `callReason`):
 ```json
 {
   "phone_number": "+15551234567",
-  "purpose": "Customer needs help with refund for order #123"
+  "purpose": "Customer needs help with refund for order #123",
+  "name": "Kate"
 }
 ```
 
-Optional fields: `voice_preference`, `additional_instructions`, and for quote flows: `quote_type`, `quote_slots`.
+Optional fields: `name`, `voice_preference`, `additional_instructions`.
 
 So the other frontend must send at least:
 
 - `phone_number` (required)
 - `purpose` (required) — this is the “call reason”
+- **`name`** (optional) — name the AI uses when introducing itself. The first introduction is: _"Hi! My name is {name}. I'm calling because …"_ If omitted, the backend uses a name parsed from purpose/instructions or the default "Holdless".
 
 If their API uses `phoneNumber` and `callReason`, they can map before calling:
 
@@ -67,8 +69,17 @@ If their API uses `phoneNumber` and `callReason`, they can map before calling:
 body: JSON.stringify({
   phone_number: phoneNumber,
   purpose: callReason,
+  name: customerName, // optional
 });
 ```
+
+### How `purpose` and `additional_instructions` are used by the AI
+
+- **`purpose`** is the main “call reason.” The AI uses it to form the **first sentence** (e.g. “I’m calling because I need help with …”) and to know the high-level goal. The agent does **not** recite `purpose` verbatim; it turns it into a natural intro.
+- **`additional_instructions`** are **not** required to be said in the first sentence. They are:
+  - Parsed for structured data (order number, email, phone, desired outcome, tone, etc.) and used when building the intro and “Available info.”
+  - Passed as full text in the system prompt under “Additional context” so the model has them for the whole call.
+- So: the AI says the **purpose** in a natural way in the first sentence; when the other side (e.g. customer service) asks for specific information, the AI uses **both** `purpose` and `additional_instructions` (and the parsed fields) to answer. You can safely put details (order number, email, account info, etc.) in `additional_instructions` and expect the agent to use them when asked, not to dump them in the opening line.
 
 ---
 
@@ -228,11 +239,11 @@ socket.emit("leave_call", callId);
 
 All of these are emitted **to the room** for that call (so only sockets that have called `join_call` with that `callId` receive them).
 
-| Event             | When it’s emitted                                            | Payload shape                                             |
-| ----------------- | ------------------------------------------------------------ | --------------------------------------------------------- |
-| **`transcript`**  | Each time a segment of speech is finalized (AI or human)     | See below                                                 |
-| **`call_status`** | Call status changes (e.g. ringing → in progress → completed) | `{ call_id: string, status: string, duration?: number }`  |
-| **`call_ended`**  | When the call is completed or failed                         | `{ call_id: string, outcome?: string, duration: number }` |
+| Event             | When it’s emitted                                                                                                       | Payload shape                                                                |
+| ----------------- | ----------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
+| **`transcript`**  | Each time a segment of speech is finalized (AI or human)                                                                | See below                                                                    |
+| **`call_status`** | Call status changes (e.g. ringing → in progress → completed)                                                            | `{ call_id: string, status: string, duration?: number }`                     |
+| **`call_ended`**  | When the call is completed or failed (e.g. user hung up). **Strong signal** – use this to show “Call ended” in your UI. | `{ call_id: string, outcome?: string, duration: number, ended_at?: string }` |
 
 **`transcript` payload:**
 
@@ -277,7 +288,9 @@ socket.on("call_status", (data) => {
 });
 
 socket.on("call_ended", (data) => {
-  console.log("Call ended:", data.duration, data.outcome);
+  // Strong signal: call has ended (e.g. user hung up). Update UI and optionally leave room.
+  console.log("Call ended:", data.duration, data.outcome, data.ended_at);
+  // data.ended_at is ISO timestamp when the call ended (if present)
   socket.emit("leave_call", data.call_id);
 });
 ```
@@ -324,6 +337,7 @@ const result = {
   callReason: data.call.purpose,
   message: data.message,
 };
+
 // result = { callId, status, callReason, message }
 ```
 
@@ -353,7 +367,7 @@ If your frontend (e.g. chat server on port 3001) logs:
 ### Fix
 
 1. **Run this backend on the port your frontend expects**
-   - Your frontend says: *"Calls: GPT-4o Realtime call backend at http://localhost:4000"* → the frontend expects the backend on **port 4000**.
+   - Your frontend says: _"Calls: GPT-4o Realtime call backend at http://localhost:4000"_ → the frontend expects the backend on **port 4000**.
    - This backend defaults to **port 3001** (see `PORT` in `backend/.env`).
    - So either:
      - **Option A (recommended when chat server uses 3001):** Run this backend on **4000** so it doesn’t conflict. In `backend/.env` set:
