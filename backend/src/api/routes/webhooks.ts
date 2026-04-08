@@ -240,11 +240,16 @@ router.post("/twilio/status", async (req: Request, res: Response) => {
     // Strong signal: emit call_ended when call is completed or failed (e.g. user hung up)
     if (status === "completed" || status === "failed") {
       const endedAt = updates.ended_at ?? new Date();
+      const fresh = await CallService.getCall(call.id);
+      const outcome = fresh?.outcome ?? call.outcome;
+      const endReason =
+        outcome === "token_budget_exceeded" ? "token_budget" : undefined;
       const payload = {
         call_id: call.id,
-        outcome: call.outcome,
+        outcome,
         duration: updates.duration_seconds ?? 0,
         ended_at: endedAt instanceof Date ? endedAt.toISOString() : endedAt,
+        ...(endReason ? { end_reason: endReason } : {}),
       };
       io.to(`call:${call.id}`).emit("call_ended", payload);
       console.log(

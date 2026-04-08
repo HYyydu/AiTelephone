@@ -24,7 +24,7 @@ testConnection()
       console.log("✅ Database connection verified");
     } else {
       console.error(
-        "❌ Database connection failed - some features may not work"
+        "❌ Database connection failed - some features may not work",
       );
       console.error("❌ Make sure DATABASE_URL is set in your .env file");
     }
@@ -77,7 +77,7 @@ export const io = new SocketIOServer(httpServer, {
       } else {
         console.warn(`⚠️  Socket.io CORS blocked: ${origin}`);
         console.warn(
-          `   Allowed patterns: Vercel, trycloudflare.com, localhost (any port), ${config.cors.origin}`
+          `   Allowed patterns: Vercel, trycloudflare.com, localhost (any port), ${config.cors.origin}`,
         );
         callback(new Error("Not allowed by CORS"));
       }
@@ -104,7 +104,7 @@ mediaStreamWss.on("connection", async (ws: any, req: any) => {
   if (callSidFromQuery) {
     (ws as any).callSidFromQuery = callSidFromQuery;
     console.log(
-      `📞 CallSid available from upgrade handler: ${callSidFromQuery}`
+      `📞 CallSid available from upgrade handler: ${callSidFromQuery}`,
     );
   }
 
@@ -114,7 +114,7 @@ mediaStreamWss.on("connection", async (ws: any, req: any) => {
 });
 
 console.log(
-  "✅ Media Stream WebSocket handler initialized (GPT-4o Realtime only)"
+  "✅ Media Stream WebSocket handler initialized (GPT-4o Realtime only)",
 );
 
 // Handle WebSocket upgrade for media streams
@@ -145,7 +145,7 @@ httpServer.on("upgrade", (request, socket, head) => {
         (request as any).callSidFromQuery = callSid;
       } else {
         console.log(
-          `⚠️  Query string exists but no callSid found: ${queryString}`
+          `⚠️  Query string exists but no callSid found: ${queryString}`,
         );
       }
     } else {
@@ -156,7 +156,7 @@ httpServer.on("upgrade", (request, socket, head) => {
     const userAgent = request.headers["user-agent"] || "";
     if (!userAgent.includes("Twilio")) {
       console.warn(
-        `⚠️  Warning: WebSocket upgrade from non-Twilio user agent: ${userAgent}`
+        `⚠️  Warning: WebSocket upgrade from non-Twilio user agent: ${userAgent}`,
       );
     }
 
@@ -174,11 +174,11 @@ httpServer.on("upgrade", (request, socket, head) => {
       console.error("❌ Error handling media stream upgrade:", error);
       console.error(
         "❌ Error details:",
-        error instanceof Error ? error.message : String(error)
+        error instanceof Error ? error.message : String(error),
       );
       console.error(
         "❌ Stack trace:",
-        error instanceof Error ? error.stack : "No stack trace"
+        error instanceof Error ? error.stack : "No stack trace",
       );
       socket.destroy();
     }
@@ -226,13 +226,13 @@ app.use(
       } else {
         console.warn(`⚠️  CORS blocked request from origin: ${origin}`);
         console.warn(
-          `   Allowed patterns: Vercel, trycloudflare.com, localhost (any port), ${config.cors.origin}`
+          `   Allowed patterns: Vercel, trycloudflare.com, localhost (any port), ${config.cors.origin}`,
         );
         callback(new Error("Not allowed by CORS"));
       }
     },
     credentials: true,
-  })
+  }),
 );
 
 // Handle ngrok browser verification for free tier
@@ -295,47 +295,70 @@ io.on("connection", (socket) => {
     console.log(`❌ Client disconnected: ${socket.id}`);
   });
 
-  socket.on("join_call", async (payload: string | { callId?: string; call_id?: string }) => {
-    const callId = typeof payload === "string" ? payload : payload?.callId ?? payload?.call_id ?? "";
-    if (!callId) {
-      console.warn(`📞 Client ${socket.id} join_call missing call id:`, payload);
-      return;
-    }
-    socket.join(`call:${callId}`);
-    console.log(`📞 Client ${socket.id} joined call room: ${callId}`);
+  socket.on(
+    "join_call",
+    async (payload: string | { callId?: string; call_id?: string }) => {
+      const callId =
+        typeof payload === "string"
+          ? payload
+          : (payload?.callId ?? payload?.call_id ?? "");
+      if (!callId) {
+        console.warn(
+          `📞 Client ${socket.id} join_call missing call id:`,
+          payload,
+        );
+        return;
+      }
+      socket.join(`call:${callId}`);
+      console.log(`📞 Client ${socket.id} joined call room: ${callId}`);
 
-    // If call already ended, send call_ended immediately so frontend gets a strong signal (e.g. after reconnect)
-    try {
-      const call = await CallService.getCall(callId);
-      if (
-        call &&
-        (call.status === "completed" || call.status === "failed") &&
-        call.ended_at
-      ) {
-        const endedAt =
-          call.ended_at instanceof Date ? call.ended_at.toISOString() : call.ended_at;
-        socket.emit("call_ended", {
-          call_id: call.id,
-          outcome: call.outcome,
-          duration: call.duration_seconds ?? 0,
-          ended_at: endedAt,
-        });
-        console.log(
-          `📴 Call already ended: sent call_ended to client ${socket.id} for call ${callId}`
+      // If call already ended, send call_ended immediately so frontend gets a strong signal (e.g. after reconnect)
+      try {
+        const call = await CallService.getCall(callId);
+        if (
+          call &&
+          (call.status === "completed" || call.status === "failed") &&
+          call.ended_at
+        ) {
+          const endedAt =
+            call.ended_at instanceof Date
+              ? call.ended_at.toISOString()
+              : call.ended_at;
+          socket.emit("call_ended", {
+            call_id: call.id,
+            outcome: call.outcome,
+            duration: call.duration_seconds ?? 0,
+            ended_at: endedAt,
+            ...(call.outcome === "token_budget_exceeded"
+              ? { end_reason: "token_budget" as const }
+              : {}),
+          });
+          console.log(
+            `📴 Call already ended: sent call_ended to client ${socket.id} for call ${callId}`,
+          );
+        }
+      } catch (err) {
+        console.warn(
+          `⚠️ Could not send call_ended on join for ${callId}:`,
+          err,
         );
       }
-    } catch (err) {
-      console.warn(`⚠️ Could not send call_ended on join for ${callId}:`, err);
-    }
-  });
+    },
+  );
 
-  socket.on("leave_call", (payload: string | { callId?: string; call_id?: string }) => {
-    const callId = typeof payload === "string" ? payload : payload?.callId ?? payload?.call_id ?? "";
-    if (callId) {
-      socket.leave(`call:${callId}`);
-      console.log(`📴 Client ${socket.id} left call room: ${callId}`);
-    }
-  });
+  socket.on(
+    "leave_call",
+    (payload: string | { callId?: string; call_id?: string }) => {
+      const callId =
+        typeof payload === "string"
+          ? payload
+          : (payload?.callId ?? payload?.call_id ?? "");
+      if (callId) {
+        socket.leave(`call:${callId}`);
+        console.log(`📴 Client ${socket.id} left call room: ${callId}`);
+      }
+    },
+  );
 });
 
 // Error handling middleware
@@ -358,23 +381,23 @@ httpServer.listen(config.port, host, () => {
   console.log(
     `🚀 Server: http://${host === "0.0.0.0" ? "localhost" : host}:${
       config.port
-    }`
+    }`,
   );
   console.log(`🚀 Listening on: ${host}:${config.port}`);
   console.log(
     `🚀 WebSocket (Frontend): ws://${host === "0.0.0.0" ? "localhost" : host}:${
       config.port
-    }`
+    }`,
   );
   console.log(
     `🚀 Media Stream: ws://${host === "0.0.0.0" ? "localhost" : host}:${
       config.port
-    }/media-stream`
+    }/media-stream`,
   );
   console.log("🚀 ============================================");
   if (host === "0.0.0.0") {
     console.log(
-      "✅ Server listening on all interfaces (0.0.0.0) - Cloudflare Tunnel can connect"
+      "✅ Server listening on all interfaces (0.0.0.0) - Cloudflare Tunnel can connect",
     );
   }
 });

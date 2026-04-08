@@ -6,8 +6,8 @@ import { config } from '../config';
 function createSupabaseClient(url: string, key: string, clientType: string): SupabaseClient {
   if (!url || !key) {
     throw new Error(
-      `❌ Supabase ${clientType} client requires SUPABASE_URL and ${clientType === 'server' ? 'SUPABASE_SERVICE_ROLE_KEY' : 'SUPABASE_ANON_KEY'} to be set in .env file.\n` +
-      `   Please add these to backend/.env:\n` +
+      `❌ Supabase ${clientType} client requires SUPABASE_URL and ${clientType === 'server' ? 'SUPABASE_SERVICE_ROLE_KEY' : 'SUPABASE_ANON_KEY'}.\n` +
+      `   Set them in the process environment (e.g. Railway → Variables), or in backend/.env for local dev:\n` +
       `   SUPABASE_URL=https://xxxxx.supabase.co\n` +
       `   SUPABASE_ANON_KEY=eyJ...\n` +
       `   SUPABASE_SERVICE_ROLE_KEY=eyJ...\n` +

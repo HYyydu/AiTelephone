@@ -18,6 +18,7 @@ import { io } from "../server";
 import { config } from "../config";
 import { RealtimeAPIConnection } from "../services/realtime-api";
 import { endCall, sendDTMF } from "../services/telephony";
+import { extractRealtimeResponseUsage } from "../services/realtime-usage";
 import {
   isLikelyAutomatedDisclosureWithoutMenu,
   planIvrDtmf,
@@ -157,6 +158,42 @@ const GREETING_PHRASES = [
   "speaking",
 ] as const;
 
+/** Prepended to Realtime system prompts: voice delivery (matches OpenAI Audio playground style guidance). */
+const REALTIME_SPEECH_STYLE_INSTRUCTIONS = `## Voice and delivery (realtime audio)
+Speak with a voice that sounds natural, warm, and friendly—just like a real person. Responses should be short, conversational, and expressive, avoiding robotic or monotone delivery. Speak with emotive inflection and use natural speech patterns.
+
+Ensure responses are brief (5-20 words) and split into back-and-forth exchanges with the user. If the user asks for even shorter replies, keep responses to 1-10 words. Prioritize a quick, engaging conversation flow, avoiding long silences or overly formal language.
+
+When you must give an order number, email, phone number, or other exact details, speak them clearly and completely; brevity rules apply to normal conversational turns, not to required verbatim information.
+
+### Examples
+
+**Example 1**
+User: What's the weather like?
+Assistant: It's sunny and warm!
+User: Should I wear shorts?
+Assistant: Yeah, that's a great idea.
+User: Will it rain later?
+Assistant: Nope, skies look clear!
+User: Awesome, thanks!
+Assistant: You got it! Have fun!
+
+**Example 2**
+User: How are you today?
+Assistant: Oh, I'm doing great!
+User: That's good! Busy day?
+Assistant: Yep, lots of chats!
+User: Do you ever get tired?
+Assistant: Not really, I'm always here.
+
+### Audio delivery
+- Use emotive, warm, natural intonation.
+- Respond quickly—don't keep the user waiting.
+- Favor short, natural-sounding phrases.
+- Break up longer responses across multiple user turns.
+- Use previous user names and context for continuity and natural style.
+- Add subtle non-verbal vocal touches when appropriate (light laughter, slight sigh, etc.).`;
+
 /**
  * GPT-4o-Realtime Handler for bidirectional audio streaming
  *
@@ -288,6 +325,15 @@ export class GPT4oRealtimeHandler {
   private idleHangupAwaitingPingResponse = false;
   private idleHangupCompleted = false;
 
+  /** OpenAI Realtime token metering (sums `response.done` usage deltas). */
+  private totalInputTokens = 0;
+  private totalOutputTokens = 0;
+  private lastUsageEmitAt = 0;
+  private lastUsageDbFlushAt = 0;
+  /** Keys from `threshold.toFixed(4)` so quota_warning fires once per tier. */
+  private usageWarningThresholdsSent = new Set<string>();
+  private tokenBudgetHangupStarted = false;
+
   constructor(ws: WebSocket) {
     this.ws = ws;
     this.setupWebSocket();
@@ -365,14 +411,17 @@ export class GPT4oRealtimeHandler {
 
   private getVoiceFromPreference(): string {
     // OpenAI Realtime API supported voices: 'alloy', 'ash', 'ballad', 'coral', 'echo', 'sage', 'shimmer', 'verse', 'marin', 'cedar'
+    if (config.openai.realtimeVoice) {
+      return config.openai.realtimeVoice;
+    }
     const voiceMap: Record<string, string> = {
-      professional_female: "shimmer", // Changed from 'nova' (not supported) to 'shimmer'
-      professional_male: "echo", // Changed from 'onyx' (not supported) to 'echo'
-      friendly_female: "coral", // Changed from 'shimmer' to 'coral' for variety
-      friendly_male: "echo",
+      professional_female: "ash",
+      professional_male: "ash",
+      friendly_female: "ash",
+      friendly_male: "ash",
     };
     return (
-      voiceMap[this.call.voice_preference || "professional_female"] || "shimmer"
+      voiceMap[this.call.voice_preference || "professional_female"] || "ash"
     );
   }
 
@@ -507,6 +556,8 @@ export class GPT4oRealtimeHandler {
     return `YOU ARE THE CUSTOMER - CRITICAL ROLE DEFINITION:
 You are ${userName}, a CUSTOMER who wants a refund/help. You are NOT customer service.
 The HUMAN on the call is the CUSTOMER SERVICE REPRESENTATIVE who will help you.
+
+${REALTIME_SPEECH_STYLE_INSTRUCTIONS}
 
 ROLE BREAKDOWN:
 - YOU (AI): CUSTOMER - You request refunds, ask for help, need assistance. You say things like "I need", "I'd like", "Can you help", "My order arrived damaged"
@@ -848,7 +899,9 @@ CALL ENDING - CRITICAL:
     const callerRules = getQuoteCallerInstructions();
     const factLines = [purpose, extra].filter((s) => s.length > 0);
     const factsBlock = factLines.join("\n\n");
-    return `${callerRules}
+    return `${REALTIME_SPEECH_STYLE_INSTRUCTIONS}
+
+${callerRules}
 
 AUTHORITATIVE FACTS — you may ONLY claim what appears here; nothing else:
 ${factsBlock}
@@ -3174,6 +3227,9 @@ CALL FLOW:
               );
             }
           } finally {
+            void this.processResponseDoneUsage(message).catch((err) =>
+              console.error("❌ processResponseDoneUsage:", err),
+            );
             this.handleIdleHangupOnResponseDone();
             this.maybeScheduleTranscriptGapClarification(this.lastAIResponse);
           }
@@ -5546,6 +5602,127 @@ CALL FLOW:
     this.idleHangupAwaitingPingResponse = false;
     if (this.idleHangupPhase === "ping_in_flight") {
       this.idleHangupPhase = "monitoring";
+    }
+  }
+
+  /**
+   * Accumulates Realtime usage, emits throttled Socket.IO events, persists token totals,
+   * and ends the Twilio call when CALL_MAX_TOKENS_PER_CALL is exceeded.
+   */
+  private async processResponseDoneUsage(message: unknown): Promise<void> {
+    if (!this.call?.id) return;
+
+    const delta = extractRealtimeResponseUsage(message);
+    if (!delta) return;
+
+    this.totalInputTokens += delta.input_tokens;
+    this.totalOutputTokens += delta.output_tokens;
+    const total = this.totalInputTokens + this.totalOutputTokens;
+
+    const max = config.call.usage.maxTokensPerCall;
+    const ratio = max > 0 ? total / max : 0;
+    const now = Date.now();
+    const { emitIntervalMs, warningThresholds, dbFlushIntervalMs } =
+      config.call.usage;
+
+    const isFirstUsage =
+      this.lastUsageEmitAt === 0 && total > 0;
+    const emitDue =
+      isFirstUsage || now - this.lastUsageEmitAt >= emitIntervalMs;
+
+    for (const t of warningThresholds) {
+      if (max <= 0 || ratio < t) continue;
+      const key = t.toFixed(4);
+      if (this.usageWarningThresholdsSent.has(key)) continue;
+      this.usageWarningThresholdsSent.add(key);
+      io.to(`call:${this.call.id}`).emit("quota_warning", {
+        call_id: this.call.id,
+        threshold: t,
+        used_tokens: total,
+        limit_tokens: max,
+        percent: Math.min(100, Math.round(ratio * 100)),
+      });
+    }
+
+    if (emitDue) {
+      this.lastUsageEmitAt = now;
+      io.to(`call:${this.call.id}`).emit("usage_update", {
+        call_id: this.call.id,
+        input_tokens: this.totalInputTokens,
+        output_tokens: this.totalOutputTokens,
+        total_tokens: total,
+        limit_tokens: max > 0 ? max : null,
+        percent_of_limit:
+          max > 0 ? Math.min(100, Math.round(ratio * 100)) : null,
+      });
+    }
+
+    const shouldFlush =
+      this.lastUsageDbFlushAt === 0 ||
+      now - this.lastUsageDbFlushAt >= dbFlushIntervalMs;
+    if (shouldFlush) {
+      this.lastUsageDbFlushAt = now;
+      try {
+        await CallService.updateCall(this.call.id, {
+          input_tokens: this.totalInputTokens,
+          output_tokens: this.totalOutputTokens,
+        });
+      } catch (e) {
+        console.warn("⚠️  Token usage DB flush failed:", e);
+      }
+    }
+
+    if (
+      config.call.usage.enforceBudget &&
+      max > 0 &&
+      total >= max &&
+      !this.tokenBudgetHangupStarted
+    ) {
+      await this.hangUpDueToTokenBudget(total, max);
+    }
+  }
+
+  private async hangUpDueToTokenBudget(
+    usedTokens: number,
+    limitTokens: number,
+  ): Promise<void> {
+    if (this.tokenBudgetHangupStarted || !this.callSid || !this.call?.id) {
+      return;
+    }
+    this.tokenBudgetHangupStarted = true;
+    this.idleHangupCompleted = true;
+    this.clearIdleHangupTimers();
+
+    try {
+      io.to(`call:${this.call.id}`).emit("usage_update", {
+        call_id: this.call.id,
+        input_tokens: this.totalInputTokens,
+        output_tokens: this.totalOutputTokens,
+        total_tokens: usedTokens,
+        limit_tokens: limitTokens,
+        percent_of_limit: 100,
+      });
+
+      io.to(`call:${this.call.id}`).emit("call_ending", {
+        call_id: this.call.id,
+        reason: "token_budget" as const,
+        message: "Call ending: token budget reached.",
+        used_tokens: usedTokens,
+        limit_tokens: limitTokens,
+      });
+
+      await CallService.updateCall(this.call.id, {
+        input_tokens: this.totalInputTokens,
+        output_tokens: this.totalOutputTokens,
+        outcome: "token_budget_exceeded",
+      });
+
+      await endCall(this.callSid);
+      console.log(
+        `📴 Token budget: Twilio call ended (used ${usedTokens} / ${limitTokens} tokens)`,
+      );
+    } catch (err) {
+      console.error("❌ Token budget hang-up failed:", err);
     }
   }
 

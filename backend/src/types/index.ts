@@ -55,6 +55,10 @@ export interface Call {
   outcome?: string;
   voice_preference?: VoiceType;
   additional_instructions?: string;
+  /** Cumulative input tokens (OpenAI Realtime), updated during the call. */
+  input_tokens?: number;
+  /** Cumulative output tokens (OpenAI Realtime), updated during the call. */
+  output_tokens?: number;
 }
 
 export interface Transcript {
@@ -101,11 +105,38 @@ export interface WebSocketEvents {
     outcome?: string;
     duration: number;
     ended_at?: string; // ISO timestamp when call ended (strong signal for frontend)
+    /** Present when known (e.g. token_budget_exceeded). */
+    end_reason?: string;
   };
   call_hold_status: {
     call_id: string;
     is_on_hold: boolean;
     conversation_state: CallConversationState;
+  };
+  /** Throttled live usage for dashboards (during call). */
+  usage_update: {
+    call_id: string;
+    input_tokens: number;
+    output_tokens: number;
+    total_tokens: number;
+    limit_tokens: number | null;
+    percent_of_limit: number | null;
+  };
+  /** Fired once when crossing a warning threshold (e.g. 80% of budget). */
+  quota_warning: {
+    call_id: string;
+    threshold: number;
+    used_tokens: number;
+    limit_tokens: number;
+    percent: number;
+  };
+  /** Emitted immediately before server ends the Twilio call (token budget). */
+  call_ending: {
+    call_id: string;
+    reason: "token_budget";
+    message: string;
+    used_tokens: number;
+    limit_tokens: number;
   };
 }
 

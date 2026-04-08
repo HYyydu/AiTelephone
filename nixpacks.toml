@@ -1,0 +1,4 @@
+# Pin Node 20+ so undici / @supabase/supabase-js get global `File` (Node 18 crashes with ReferenceError: File is not defined).
+# Railway reads this; you can also set NIXPACKS_NODE_VERSION=20 in the service Variables.
+[variables]
+NIXPACKS_NODE_VERSION = "20"

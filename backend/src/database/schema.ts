@@ -48,6 +48,9 @@ export const calls = pgTable("calls", {
   recording_url: text("recording_url"), // URL to call recording
   duration: integer("duration"), // seconds
   cost: integer("cost"), // cents
+  /** Cumulative OpenAI Realtime usage for this call (sum of response.done deltas). */
+  input_tokens: integer("input_tokens"),
+  output_tokens: integer("output_tokens"),
   created_at: timestamp("created_at").defaultNow(),
   started_at: timestamp("started_at"),
   ended_at: timestamp("ended_at"),

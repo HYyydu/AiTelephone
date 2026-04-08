@@ -31,7 +31,7 @@ export class RealtimeAPIConnection {
   constructor(realtimeConfig: RealtimeConfig = {}) {
     this.realtimeConfig = {
       model: realtimeConfig.model || "gpt-4o-realtime-preview-2024-12-17",
-      voice: realtimeConfig.voice || "alloy",
+      voice: realtimeConfig.voice || "ash",
       temperature: realtimeConfig.temperature || 1.0,
       max_response_output_tokens:
         realtimeConfig.max_response_output_tokens || 4096,
@@ -146,7 +146,7 @@ export class RealtimeAPIConnection {
       session: {
         modalities: ["text", "audio"],
         instructions: instructions || this.realtimeConfig.instructions || "",
-        voice: this.realtimeConfig.voice || "alloy",
+        voice: this.realtimeConfig.voice || "ash",
         input_audio_format: "pcm16", // PCM 16-bit, 24kHz
         output_audio_format: "pcm16",
         input_audio_transcription: {

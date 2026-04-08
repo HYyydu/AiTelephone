@@ -24,6 +24,8 @@ export const config = {
       process.env.OPENAI_REALTIME_API_URL || "wss://api.openai.com/v1/realtime",
     realtimeModel:
       process.env.OPENAI_REALTIME_MODEL || "gpt-4o-realtime-preview-2024-12-17",
+    /** OpenAI Realtime session voice (e.g. ash, coral). Empty = use per-call voice_preference mapping in handler. */
+    realtimeVoice: (process.env.OPENAI_REALTIME_VOICE || "").trim(),
     // Anti-repetition settings (0.0 to 2.0)
     // frequency_penalty: reduces repetition of tokens based on frequency in the text so far
     // presence_penalty: reduces repetition of tokens based on whether they appear in the text so far
@@ -213,6 +215,41 @@ export const config = {
         10,
       ),
     },
+    /**
+     * OpenAI Realtime token metering (per call). Sum of `response.done` usage deltas.
+     * CALL_MAX_TOKENS_PER_CALL=0 disables enforcement (still tracks + emits if usage present).
+     */
+    usage: (() => {
+      const maxTokensPerCall = parseInt(
+        process.env.CALL_MAX_TOKENS_PER_CALL || "0",
+        10,
+      );
+      const enforceBudget =
+        process.env.CALL_TOKEN_BUDGET_ENFORCE !== "false" &&
+        Number.isFinite(maxTokensPerCall) &&
+        maxTokensPerCall > 0;
+      const raw = process.env.CALL_USAGE_WARN_THRESHOLDS || "0.8,0.95";
+      const warningThresholds = raw
+        .split(",")
+        .map((s) => parseFloat(s.trim()))
+        .filter((n) => Number.isFinite(n) && n > 0 && n < 1);
+      return {
+        maxTokensPerCall: Number.isFinite(maxTokensPerCall)
+          ? Math.max(0, maxTokensPerCall)
+          : 0,
+        enforceBudget,
+        warningThresholds:
+          warningThresholds.length > 0 ? warningThresholds : [0.8, 0.95],
+        emitIntervalMs: parseInt(
+          process.env.CALL_USAGE_EMIT_INTERVAL_MS || "10000",
+          10,
+        ),
+        dbFlushIntervalMs: parseInt(
+          process.env.CALL_USAGE_DB_FLUSH_INTERVAL_MS || "15000",
+          10,
+        ),
+      };
+    })(),
   },
 
   // Auth: when true, requireAuth middleware allows unauthenticated requests (dev/testing only)
@@ -295,6 +332,17 @@ export function validateConfig() {
   if (process.env.CALL_IDLE_HANGUP_ENABLED === "true") {
     console.log(
       "📞 CALL_IDLE_HANGUP_ENABLED=true: agent may end Twilio call after idle ping + silence",
+    );
+  }
+
+  const maxTok = parseInt(process.env.CALL_MAX_TOKENS_PER_CALL || "0", 10);
+  if (Number.isFinite(maxTok) && maxTok > 0) {
+    console.log(
+      `📊 CALL_MAX_TOKENS_PER_CALL=${maxTok}: token budget enforced (Twilio hang-up when reached unless CALL_TOKEN_BUDGET_ENFORCE=false)`,
+    );
+  } else {
+    console.log(
+      "📊 CALL_MAX_TOKENS_PER_CALL=0: per-call token limit disabled (usage still tracked when API sends usage)",
     );
   }
 }

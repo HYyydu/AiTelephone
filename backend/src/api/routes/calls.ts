@@ -75,6 +75,45 @@ router.post(
         });
       }
 
+      let freeTrialRemaining: number | undefined;
+      if (userId) {
+        try {
+          const quotaResult = await CallService.consumeFreeCallRequest(userId);
+          freeTrialRemaining = quotaResult.remaining;
+
+          console.log(
+            JSON.stringify({
+              event: "free_call_quota_check",
+              endpoint: "/api/calls",
+              user_id: userId,
+              quota_allowed: quotaResult.allowed,
+              remaining: quotaResult.remaining,
+            }),
+          );
+
+          if (!quotaResult.allowed) {
+            return res.status(403).json({
+              error: "Free trial exhausted",
+              code: "FREE_CALL_LIMIT_REACHED",
+              free_trial_remaining: 0,
+            });
+          }
+        } catch (error) {
+          console.error(
+            JSON.stringify({
+              event: "free_call_quota_check_failed",
+              endpoint: "/api/calls",
+              user_id: userId,
+              message: error instanceof Error ? error.message : "Unknown error",
+            }),
+          );
+          return res.status(503).json({
+            error: "Free trial check unavailable",
+            code: "FREE_CALL_QUOTA_UNAVAILABLE",
+          });
+        }
+      }
+
       // Create call record with sanitized inputs
       // All calls now use GPT-4o Realtime
       console.log(`📝 Creating call with GPT-4o Realtime for user: ${userId}`);
@@ -112,6 +151,7 @@ router.post(
         success: true,
         call,
         message: "Call queued successfully",
+        free_trial_remaining: freeTrialRemaining,
       });
     } catch (error) {
       console.error("Error creating call:", error);

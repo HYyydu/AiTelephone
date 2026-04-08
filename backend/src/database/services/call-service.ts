@@ -2,7 +2,17 @@
 import { db } from '../db';
 import { calls, transcripts } from '../schema';
 import { Call, Transcript, CallStatus } from '../../types';
-import { eq, and, desc } from 'drizzle-orm';
+import { eq, and, desc, sql } from 'drizzle-orm';
+
+type FreeCallConsumeResultRow = {
+  allowed: boolean;
+  remaining: number;
+};
+
+export type FreeCallConsumeResult = {
+  allowed: boolean;
+  remaining: number;
+};
 
 /**
  * Convert database call record to Call interface
@@ -24,6 +34,8 @@ function dbCallToCall(dbCall: typeof calls.$inferSelect): Call {
     outcome: dbCall.outcome || undefined,
     voice_preference: dbCall.voice_preference as any,
     additional_instructions: dbCall.additional_instructions || undefined,
+    input_tokens: dbCall.input_tokens ?? undefined,
+    output_tokens: dbCall.output_tokens ?? undefined,
   };
 }
 
@@ -47,6 +59,8 @@ function callToDbCall(call: Call): typeof calls.$inferInsert {
     outcome: call.outcome || null,
     voice_preference: call.voice_preference || 'professional_female',
     additional_instructions: call.additional_instructions || null,
+    input_tokens: call.input_tokens ?? null,
+    output_tokens: call.output_tokens ?? null,
   };
 }
 
@@ -82,6 +96,30 @@ function transcriptToDbTranscript(transcript: Transcript): typeof transcripts.$i
  * Call service - handles all database operations for calls
  */
 export class CallService {
+  /**
+   * Atomically consume one free trial call request for a user.
+   */
+  static async consumeFreeCallRequest(userId: string): Promise<FreeCallConsumeResult> {
+    try {
+      const result = await db.execute<FreeCallConsumeResultRow>(
+        sql`select * from public.consume_free_call_request(${userId}::uuid);`
+      );
+
+      const row = result.rows[0];
+      if (!row) {
+        throw new Error('consume_free_call_request returned no rows');
+      }
+
+      return {
+        allowed: row.allowed,
+        remaining: row.remaining,
+      };
+    } catch (error) {
+      console.error('Error consuming free call request:', error);
+      throw error;
+    }
+  }
+
   /**
    * Create a new call record
    */
@@ -174,6 +212,8 @@ export class CallService {
       if (updates.outcome !== undefined) dbUpdates.outcome = updates.outcome;
       if (updates.voice_preference !== undefined) dbUpdates.voice_preference = updates.voice_preference;
       if (updates.additional_instructions !== undefined) dbUpdates.additional_instructions = updates.additional_instructions;
+      if (updates.input_tokens !== undefined) dbUpdates.input_tokens = updates.input_tokens;
+      if (updates.output_tokens !== undefined) dbUpdates.output_tokens = updates.output_tokens;
 
       const [updated] = await db
         .update(calls)
