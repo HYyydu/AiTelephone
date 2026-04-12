@@ -79,6 +79,8 @@ export const config = {
     url: process.env.SUPABASE_URL || "",
     anonKey: process.env.SUPABASE_ANON_KEY || "",
     serviceRoleKey: process.env.SUPABASE_SERVICE_ROLE_KEY || "",
+    /** Project JWT secret (Settings → API → JWT Secret). Used to verify access tokens locally if getUser() fails. */
+    jwtSecret: process.env.SUPABASE_JWT_SECRET || "",
   },
 
   // Google Places / search provider configuration
@@ -299,6 +301,14 @@ export function validateConfig() {
     );
     console.warn(
       "⚠️  Add SUPABASE_URL, SUPABASE_ANON_KEY, and SUPABASE_SERVICE_ROLE_KEY to .env",
+    );
+  }
+  if (
+    process.env.SUPABASE_JWT_SECRET &&
+    (!process.env.SUPABASE_ANON_KEY || !process.env.SUPABASE_URL)
+  ) {
+    console.log(
+      "ℹ️  SUPABASE_JWT_SECRET is set — access tokens can be verified locally if URL/anon key are missing or getUser fails",
     );
   }
 

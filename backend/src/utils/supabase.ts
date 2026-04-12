@@ -1,5 +1,6 @@
 // Supabase client for authentication
-import { createClient, SupabaseClient } from '@supabase/supabase-js';
+import { createClient, SupabaseClient, User } from '@supabase/supabase-js';
+import { jwtVerify } from 'jose';
 import { config } from '../config';
 
 // Helper function to create Supabase client with validation
@@ -38,16 +39,69 @@ export const supabaseClient = createSupabaseClient(
   'client'
 );
 
+/**
+ * Verify Supabase access token using the project's JWT secret (HS256).
+ * Used when getUser() fails (e.g. wrong anon key in deployment) but JWT is valid.
+ */
+async function verifyAuthTokenWithJwtSecret(token: string): Promise<User | null> {
+  const secret = config.supabase.jwtSecret?.trim();
+  if (!secret) {
+    return null;
+  }
+  try {
+    const key = new TextEncoder().encode(secret);
+    const { payload } = await jwtVerify(token, key, {
+      algorithms: ['HS256'],
+    });
+    const sub = payload.sub;
+    if (!sub || typeof sub !== 'string') {
+      return null;
+    }
+    const email =
+      typeof payload.email === 'string' ? payload.email : undefined;
+    const userMetadata =
+      payload.user_metadata &&
+      typeof payload.user_metadata === 'object' &&
+      !Array.isArray(payload.user_metadata)
+        ? (payload.user_metadata as User['user_metadata'])
+        : {};
+    return {
+      id: sub,
+      email,
+      user_metadata: userMetadata ?? {},
+      app_metadata: {},
+      aud: typeof payload.aud === 'string' ? payload.aud : 'authenticated',
+      created_at: '',
+      updated_at: '',
+    } as User;
+  } catch {
+    return null;
+  }
+}
+
 // Helper function to verify JWT token from Authorization header
 export async function verifyAuthToken(token: string) {
   try {
     const { data: { user }, error } = await supabaseClient.auth.getUser(token);
-    
-    if (error || !user) {
-      return null;
+
+    if (user && !error) {
+      return user;
     }
-    
-    return user;
+
+    // Fallback: this codebase never read SUPABASE_JWT_SECRET before; production often sets
+    // only JWT secret while getUser() fails if URL/anon key mismatch or network issues.
+    const localUser = await verifyAuthTokenWithJwtSecret(token);
+    if (localUser) {
+      return localUser;
+    }
+
+    if (error) {
+      console.warn(
+        'verifyAuthToken: getUser failed and JWT secret verification did not succeed:',
+        error.message,
+      );
+    }
+    return null;
   } catch (error) {
     console.error('Error verifying auth token:', error);
     return null;

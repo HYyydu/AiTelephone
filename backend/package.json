@@ -30,6 +30,7 @@
     "express": "^5.1.0",
     "express-rate-limit": "^8.2.1",
     "ioredis": "^5.9.2",
+    "jose": "^6.2.2",
     "openai": "^6.9.1",
     "pcm-convert": "^1.6.5",
     "pg": "^8.16.3",

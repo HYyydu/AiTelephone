@@ -265,6 +265,9 @@ export class GPT4oRealtimeHandler {
   private lastUserTranscriptForResponse: string = ""; // Track which user transcript triggered the current response
   private currentResponseCreatedWithUnknownTranscript: boolean = false; // True when response.created had no transcript (API replied before our transcription)
   private respondedToTranscripts: Set<string> = new Set(); // Track which transcripts we've already responded to (prevent loops)
+  // True after AI asks a question; blocks immediate follow-up auto-responses until a new human line is saved.
+  private awaitingFreshHumanAfterAiQuestion: boolean = false;
+  private awaitingFreshHumanQuestionAskedAt: number = 0;
   private pendingTranscriptionValidation: Map<
     string,
     { transcript: string; timestamp: number }
@@ -1233,6 +1236,37 @@ CALL FLOW:
     if (since < 350 || since > 22000) return false;
     if (this.lastHumanTranscriptSavedAt >= this.lastResponseEndTime)
       return false;
+    return true;
+  }
+
+  /**
+   * After AI asks a question, ignore immediate auto-created follow-up responses
+   * until we persist a fresh human transcript.
+   */
+  private shouldCancelResponseWhileAwaitingFreshHumanAfterQuestion(): boolean {
+    if (!this.awaitingFreshHumanAfterAiQuestion) return false;
+
+    const now = Date.now();
+    const sinceQuestion =
+      this.awaitingFreshHumanQuestionAskedAt > 0
+        ? now - this.awaitingFreshHumanQuestionAskedAt
+        : Infinity;
+
+    // Safety valve: avoid getting stuck forever if no subsequent events clear this state.
+    if (sinceQuestion > 30000) {
+      this.awaitingFreshHumanAfterAiQuestion = false;
+      this.awaitingFreshHumanQuestionAskedAt = 0;
+      return false;
+    }
+
+    // A human line saved after the question means we can allow new responses.
+    if (
+      this.lastHumanTranscriptSavedAt > 0 &&
+      this.lastHumanTranscriptSavedAt >= this.awaitingFreshHumanQuestionAskedAt
+    ) {
+      return false;
+    }
+
     return true;
   }
 
@@ -2489,6 +2523,30 @@ CALL FLOW:
             `📅 Latest user speech timestamp: ${this.latestUserSpeechTimestamp}`,
           );
 
+          // Guardrail: right after AI asks a question, OpenAI can enqueue a spurious
+          // immediate follow-up response before any real human transcript is persisted.
+          // Cancel it to preserve turn-taking.
+          if (
+            this.realtimeConnection &&
+            this.shouldCancelResponseWhileAwaitingFreshHumanAfterQuestion()
+          ) {
+            console.log(
+              "🛑 CANCELLING FOLLOW-UP response.created — waiting for a NEW human line after AI question",
+            );
+            console.log(
+              `   Current respondingTo: "${respondingTo}" (ignored until fresh human transcript is saved)`,
+            );
+            this.realtimeConnection.cancelResponse();
+            this.isProcessingResponse = false;
+            this.responseStartTime = 0;
+            this.aiHasSpokenAudio = false;
+            this.hasPendingResponseRequest = false;
+            this.shouldStopAudio = false;
+            this.lastProcessedUserTranscript = "";
+            this.lastUserTranscriptForResponse = "";
+            return;
+          }
+
           // 🚨 CRITICAL: Check if we've already responded to this transcript
           // This prevents duplicate responses when OpenAI creates a response after we've already handled it
           // This can happen due to race conditions where response.done hasn't cleared the transcript yet
@@ -2946,6 +3004,8 @@ CALL FLOW:
             // The old accumulated transcript was already addressed - we need to wait for NEW user input
             const aiJustAskedQuestion = this.containsQuestion(transcriptText);
             if (aiJustAskedQuestion) {
+              this.awaitingFreshHumanAfterAiQuestion = true;
+              this.awaitingFreshHumanQuestionAskedAt = Date.now();
               console.log(
                 `❓ AI just asked a question - clearing accumulated transcript to wait for NEW user response`,
               );
@@ -4699,6 +4759,13 @@ CALL FLOW:
 
     if (speaker === "human") {
       this.lastHumanTranscriptSavedAt = Date.now();
+      if (this.awaitingFreshHumanAfterAiQuestion) {
+        console.log(
+          "✅ Fresh human transcript received after AI question - allowing next AI turn",
+        );
+      }
+      this.awaitingFreshHumanAfterAiQuestion = false;
+      this.awaitingFreshHumanQuestionAskedAt = 0;
     }
 
     try {
