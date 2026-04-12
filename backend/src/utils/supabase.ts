@@ -1,7 +1,60 @@
 // Supabase client for authentication
+import { createHmac, timingSafeEqual } from 'crypto';
 import { createClient, SupabaseClient, User } from '@supabase/supabase-js';
-import { jwtVerify } from 'jose';
 import { config } from '../config';
+
+function base64UrlToBuffer(segment: string): Buffer {
+  let s = segment.replace(/-/g, '+').replace(/_/g, '/');
+  const pad = s.length % 4;
+  if (pad) s += '='.repeat(4 - pad);
+  return Buffer.from(s, 'base64');
+}
+
+/**
+ * Verify HS256 JWT with shared secret (Supabase default). Pure Node crypto — no ESM-only deps.
+ */
+function verifyJwtHs256(
+  token: string,
+  secret: string,
+): Record<string, unknown> | null {
+  const parts = token.split('.');
+  if (parts.length !== 3) return null;
+  const [headerB64, payloadB64, sigB64] = parts;
+  let header: { alg?: string };
+  try {
+    header = JSON.parse(base64UrlToBuffer(headerB64).toString('utf8')) as {
+      alg?: string;
+    };
+  } catch {
+    return null;
+  }
+  if (header.alg !== 'HS256') return null;
+
+  const data = `${headerB64}.${payloadB64}`;
+  const expectedSig = createHmac('sha256', secret).update(data).digest();
+  let sigBuf: Buffer;
+  try {
+    sigBuf = base64UrlToBuffer(sigB64);
+  } catch {
+    return null;
+  }
+  if (sigBuf.length !== expectedSig.length) return null;
+  if (!timingSafeEqual(sigBuf, expectedSig)) return null;
+
+  let payload: Record<string, unknown>;
+  try {
+    payload = JSON.parse(
+      base64UrlToBuffer(payloadB64).toString('utf8'),
+    ) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+
+  const exp = payload.exp;
+  if (typeof exp === 'number' && Date.now() / 1000 > exp) return null;
+
+  return payload;
+}
 
 // Helper function to create Supabase client with validation
 function createSupabaseClient(url: string, key: string, clientType: string): SupabaseClient {
@@ -49,10 +102,9 @@ async function verifyAuthTokenWithJwtSecret(token: string): Promise<User | null>
     return null;
   }
   try {
-    const key = new TextEncoder().encode(secret);
-    const { payload } = await jwtVerify(token, key, {
-      algorithms: ['HS256'],
-    });
+    const payload = verifyJwtHs256(token, secret);
+    if (!payload) return null;
+
     const sub = payload.sub;
     if (!sub || typeof sub !== 'string') {
       return null;
