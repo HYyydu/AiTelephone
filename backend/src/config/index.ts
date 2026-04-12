@@ -109,10 +109,19 @@ export const config = {
     ), // 12 hours default
   },
 
-  // CORS configuration
-  cors: {
-    origin: process.env.CORS_ORIGIN || "http://localhost:3000",
-  },
+  // CORS: comma-separated origins (e.g. https://holdless-ai.com,http://localhost:3000)
+  cors: (() => {
+    const raw = process.env.CORS_ORIGIN || "http://localhost:3000";
+    const origins = raw
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    return {
+      /** First origin (legacy / single-URL consumers) */
+      origin: origins[0] || "http://localhost:3000",
+      origins: origins.length ? origins : ["http://localhost:3000"],
+    };
+  })(),
 
   // Call configuration
   call: {

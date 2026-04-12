@@ -56,7 +56,7 @@ export const io = new SocketIOServer(httpServer, {
         /^https:\/\/ai-telephone-front-git-.*\.vercel\.app$/,
         /^https:\/\/.*\.trycloudflare\.com$/, // Cloudflare tunnel URLs
         /^http:\/\/.*\.trycloudflare\.com$/, // HTTP Cloudflare tunnel (if any)
-        config.cors.origin,
+        ...config.cors.origins,
         "http://localhost:3000",
         "https://localhost:3000",
         /^https?:\/\/localhost(:\d+)?$/, // Any localhost port (e.g. 8080)
@@ -77,7 +77,7 @@ export const io = new SocketIOServer(httpServer, {
       } else {
         console.warn(`⚠️  Socket.io CORS blocked: ${origin}`);
         console.warn(
-          `   Allowed patterns: Vercel, trycloudflare.com, localhost (any port), ${config.cors.origin}`,
+          `   Allowed patterns: Vercel, trycloudflare.com, localhost (any port), CORS_ORIGIN: ${config.cors.origins.join(", ")}`,
         );
         callback(new Error("Not allowed by CORS"));
       }
@@ -205,7 +205,7 @@ app.use(
         /^https:\/\/ai-telephone-front-git-.*\.vercel\.app$/, // Git branch deployments
         /^https:\/\/.*\.trycloudflare\.com$/, // Cloudflare tunnel URLs
         /^http:\/\/.*\.trycloudflare\.com$/, // HTTP Cloudflare tunnel (if any)
-        config.cors.origin, // Also allow configured origin
+        ...config.cors.origins,
         "http://localhost:3000", // Local development
         "https://localhost:3000",
         /^https?:\/\/localhost(:\d+)?$/, // Any localhost port (e.g. 8080)
@@ -226,7 +226,7 @@ app.use(
       } else {
         console.warn(`⚠️  CORS blocked request from origin: ${origin}`);
         console.warn(
-          `   Allowed patterns: Vercel, trycloudflare.com, localhost (any port), ${config.cors.origin}`,
+          `   Allowed patterns: Vercel, trycloudflare.com, localhost (any port), CORS_ORIGIN: ${config.cors.origins.join(", ")}`,
         );
         callback(new Error("Not allowed by CORS"));
       }
