@@ -140,6 +140,9 @@ export class RealtimeAPIConnection {
     console.log(
       `   - VAD Threshold: ${process.env.OPENAI_VAD_THRESHOLD || "0.05"}`
     );
+    console.log(
+      `   - VAD create_response (API auto-reply per turn): ${process.env.OPENAI_VAD_CREATE_RESPONSE === "true"}`,
+    );
 
     const sessionConfig = {
       type: "session.update",
@@ -154,6 +157,10 @@ export class RealtimeAPIConnection {
         },
         turn_detection: {
           type: "server_vad",
+          // When false (default), the API does not auto-emit response.create after each turn; only our
+          // explicit response.create (after transcription + debounce) runs. Prevents echo/noise from
+          // triggering unsolicited replies. Set OPENAI_VAD_CREATE_RESPONSE=true to restore API auto-replies.
+          create_response: process.env.OPENAI_VAD_CREATE_RESPONSE === "true",
           // VAD threshold: Lower = more sensitive to speech (0.05-0.2 range)
           // 0.05-0.08 = MAXIMUM sensitivity - detects even quiet speech immediately
           // Default: 0.05 for maximum sensitivity to catch user speech as early as possible

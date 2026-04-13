@@ -48,6 +48,8 @@ const TIMING_THRESHOLDS = {
   ECHO_SUPPRESSION_MS: 2000, // Extended to catch more echo during AI speech
   ECHO_SUPPRESSION_EXTENDED_MS: 3000, // Extended to catch more echo during AI speech
   POST_RESPONSE_ECHO_MS: 6000, // 6s for phones (long acoustic feedback) - short transcripts in this window treated as echo
+  /** Max time after AI audio ends where we still cancel auto/spurious responses if no human line was saved after that AI turn */
+  POST_AI_AUTORESPONSE_GUARD_MS: 20000,
   SUSPECTED_SPEECH_TIMEOUT_MS: 2000,
   SPEECH_SUSPECTED_LOG_THROTTLE_MS: 2000,
   MIN_SPEECH_INTERVAL_MS: 100,
@@ -311,6 +313,8 @@ export class GPT4oRealtimeHandler {
   private activeKeyedQuestionGen = 0;
   /** Last time we persisted a human line (for gap detection vs keyed questions). */
   private lastHumanTranscriptSavedAt = 0;
+  /** When we dropped a short phrase as echo (e.g. "Thank you.") — VAD may still commit and (if create_response is on) queue a reply. */
+  private lastIgnoredShortEchoLikeTranscriptAt = 0;
   /** AI asked a question that likely expects a number/price/order id — used for backfill + clarify. */
   private lastKeyedQuestionAskedAt = 0;
   private lastKeyedQuestionSnippet = "";
@@ -648,8 +652,9 @@ CRITICAL: You MUST NEVER respond to your own voice or echo/feedback.
 WAIT for representative to greet you first. 
 
 RESPONDING TO GREETINGS:
-- If they say "Hello", "Hi", "How are you?", or similar greetings: Respond with a friendly greeting and your introduction
-- If they ask "How can I help you?" or "What can I do for you?": Respond with your full introduction including the order number
+- If they ONLY say a short greeting ("Hello", "Hi", "Hello?", "How are you?") with no request for details: Reply briefly — greet back, give your name, and say you're calling about an order you need help with. Do NOT yet describe the specific product/issue (e.g. strawberries) or the full refund ask; save that for when they ask how they can help or what you need.
+- If they ask "How can I help you?", "What can I do for you?", or similar: THEN give your full introduction including the specific issue and desired outcome (and order number when appropriate per rules below)
+- If they ask "How can I help you?" or "What can I do for you?": Respond with your full introduction including the order number when applicable
 - Do NOT jump straight to the order number when they just say "Hello" or "Hi" - that's just a greeting, not a request for information
 
 INTRODUCTION FORMAT:
@@ -657,7 +662,9 @@ When introducing yourself, use this natural format:
 
 ${
   orderNumber && orderNumberSpelled
-    ? `Example for greeting response: "Hi! My name is ${userName}. I'm calling because I need help with ${
+    ? `If they ONLY said hello/hi (short greeting): "Hi! I'm ${userName}. I'm calling about an order I need help with." (stop there)
+
+If they ask "How can I help you?" / what you need / similar: "Hi! My name is ${userName}. I'm calling because I need help with ${
         companyName ? `a ${companyName} order` : "an order"
       }. ${
         issueDescription
@@ -665,8 +672,10 @@ ${
           : "I have an issue with my order,"
       } and I'd like to ${
         desiredOutcome ? desiredOutcome.toLowerCase() : "request a refund"
-      }."\n\nIf they ask for the order number or say "How can I help you?", then add: "The order number is ${orderNumberSpelled}."`
-    : `Example format: "Hi! My name is ${userName}. I'm calling because I need help with ${
+      }." If they ask for the order number: "The order number is ${orderNumberSpelled}."`
+    : `If they ONLY said hello/hi: "Hi! I'm ${userName}. I'm calling about an order I need help with." (stop there)
+
+When they ask how they can help or what happened, use: "Hi! My name is ${userName}. I'm calling because I need help with ${
         companyName ? `a ${companyName} order` : "an order"
       }. ${
         issueDescription
@@ -680,7 +689,7 @@ ${
 CRITICAL INTRODUCTION RULES:
 - Make it natural and conversational - speak like a real customer, not a robot listing fields
 - Do NOT say: "Customer needs help with... Issue Type:... Order Number:... Desired Outcome:..."
-- DO say: "Hi, my name is [name]. I'm calling because I need help with [company] order. My [item] arrived damaged. I'd like to request a [outcome]."
+- After a bare greeting from them, keep it short (name + calling about an order). When they ask how they can help, THEN say: "Hi, my name is [name]. I'm calling because I need help with [company] order. My [item] arrived damaged. I'd like to request a [outcome]."
 - If you have an order number, include it ONLY when:
   1. They ask "How can I help you?" or similar questions
   2. They explicitly ask for the order number
@@ -748,10 +757,11 @@ REMEMBER: You are the CUSTOMER. You REQUEST help. The REPRESENTATIVE provides he
 
 RESPONDING TO DIFFERENT SITUATIONS:
 
-1. SIMPLE GREETINGS ("Hello", "Hi", "How are you?", "This is [name]"):
-   → Respond with: "Hi! My name is [your name]. I'm calling because [reason]."
+1. SIMPLE GREETINGS ONLY ("Hello", "Hi", "Hello?", "How are you?", "This is [name]") — no request for your issue yet:
+   → Short reply only: greet + your name + that you're calling about an order / need help. Example tone: "Hi! Thanks for picking up — I'm [name]. I'm calling about an order I need help with."
+   → Do NOT list the specific item, damage story, or full refund language until they ask how they can help or what happened
    → Do NOT provide order number or other details unless asked
-   → Wait for them to ask "How can I help you?" or similar before providing full details
+   → When they ask "How can I help you?" or similar, THEN give the full issue and desired outcome (and order number per rules)
 
 2. WHEN ASKED "How can I help you?" or "What can I do for you?":
    → Provide your full introduction including the issue and desired outcome
@@ -1237,6 +1247,48 @@ CALL FLOW:
     if (this.lastHumanTranscriptSavedAt >= this.lastResponseEndTime)
       return false;
     return true;
+  }
+
+  /**
+   * After the AI finishes speaking, OpenAI server VAD may still commit echo/feedback as a "turn"
+   * and auto-create a response even though the user did not speak again. We already ignore
+   * speech_stopped in this window, but that does not stop the API from generating.
+   * Cancel when no NEW human transcript was saved since our last AI audio ended.
+   */
+  private shouldCancelEchoTriggeredSpuriousResponse(): boolean {
+    if (this.idleHangupAwaitingPingResponse) return false;
+    // Continuation / split responses: do not cancel a second response.created mid-turn
+    if (this.isProcessingResponse) return false;
+    if (!this.lastResponseEndTime) return false;
+    if (!this.lastHumanTranscriptSavedAt) return false;
+    const since = Date.now() - this.lastResponseEndTime;
+    if (
+      since < 0 ||
+      since >= TIMING_THRESHOLDS.POST_AI_AUTORESPONSE_GUARD_MS
+    )
+      return false;
+    // Legitimate next turn: user line persisted at/after AI audio ended
+    if (this.lastHumanTranscriptSavedAt >= this.lastResponseEndTime)
+      return false;
+    return true;
+  }
+
+  /**
+   * We dropped ASR text as echo, but the server may still commit audio and create a response.
+   * Cancel that follow-up for a short window (esp. if OPENAI_VAD_CREATE_RESPONSE=true).
+   */
+  private shouldCancelResponseAfterIgnoredEchoLikeTranscript(
+    respondingTo: string,
+  ): boolean {
+    if (respondingTo !== "(unknown - no transcript tracked)") return false;
+    if (this.idleHangupAwaitingPingResponse) return false;
+    if (this.isProcessingResponse) return false;
+    if (this.lastIgnoredShortEchoLikeTranscriptAt <= 0) return false;
+    const sinceDrop = Date.now() - this.lastIgnoredShortEchoLikeTranscriptAt;
+    return (
+      sinceDrop >= 0 &&
+      sinceDrop < TIMING_THRESHOLDS.POST_AI_AUTORESPONSE_GUARD_MS
+    );
   }
 
   /**
@@ -2547,6 +2599,38 @@ CALL FLOW:
             return;
           }
 
+          if (
+            this.realtimeConnection &&
+            this.shouldCancelEchoTriggeredSpuriousResponse()
+          ) {
+            console.log(
+              "🛑 CANCELLING response.created — post-AI echo window, no new human transcript since AI finished (likely VAD echo/feedback)",
+            );
+            this.realtimeConnection.cancelResponse();
+            this.isProcessingResponse = false;
+            this.responseStartTime = 0;
+            this.aiHasSpokenAudio = false;
+            this.hasPendingResponseRequest = false;
+            this.shouldStopAudio = false;
+            return;
+          }
+
+          if (
+            this.realtimeConnection &&
+            this.shouldCancelResponseAfterIgnoredEchoLikeTranscript(respondingTo)
+          ) {
+            console.log(
+              "🛑 CANCELLING response.created — unknown turn right after ignored echo-like transcript (VAD may still commit audio)",
+            );
+            this.realtimeConnection.cancelResponse();
+            this.isProcessingResponse = false;
+            this.responseStartTime = 0;
+            this.aiHasSpokenAudio = false;
+            this.hasPendingResponseRequest = false;
+            this.shouldStopAudio = false;
+            return;
+          }
+
           // 🚨 CRITICAL: Check if we've already responded to this transcript
           // This prevents duplicate responses when OpenAI creates a response after we've already handled it
           // This can happen due to race conditions where response.done hasn't cleared the transcript yet
@@ -2644,12 +2728,27 @@ CALL FLOW:
               console.log(
                 "   Response will be checked for duplicate introductions before being saved",
               );
-            } else {
-              // After greeting is sent, if we have no transcript but response was created,
-              // it might be a legitimate response that was triggered by audio detection
-              // Allow it to proceed but log a warning
+            } else if (
+              this.realtimeConnection &&
+              this.lastResponseEndTime > 0 &&
+              this.lastHumanTranscriptSavedAt > 0 &&
+              this.lastHumanTranscriptSavedAt < this.lastResponseEndTime &&
+              !this.idleHangupAwaitingPingResponse
+            ) {
+              // No persisted human line since the last AI audio ended — almost always VAD/echo, not a real new turn
               console.log(
-                "   ⚠️  Response created without tracked transcript, but allowing to proceed (might be legitimate audio-triggered response)",
+                "🛑 CANCELLING INVALID RESPONSE — no tracked transcript and no new human line since AI finished (likely echo or API auto-response)",
+              );
+              this.realtimeConnection.cancelResponse();
+              this.isProcessingResponse = false;
+              this.responseStartTime = 0;
+              this.aiHasSpokenAudio = false;
+              this.hasPendingResponseRequest = false;
+              this.shouldStopAudio = false;
+              return;
+            } else {
+              console.log(
+                "   ⚠️  Response created without tracked transcript — allowing (edge case; check OPENAI_VAD_CREATE_RESPONSE)",
               );
             }
           }
@@ -3565,6 +3664,7 @@ CALL FLOW:
             console.log(
               `   Likely echo/feedback - not saving or responding (POST_RESPONSE_ECHO_MS=${TIMING_THRESHOLDS.POST_RESPONSE_ECHO_MS}ms)`,
             );
+            this.lastIgnoredShortEchoLikeTranscriptAt = Date.now();
             this.enqueueDroppedSubstantiveTranscript(userTranscript);
             break;
           }
