@@ -3,6 +3,7 @@ import { Router, Request, Response } from "express";
 import { CallService } from "../../database/services/call-service";
 import { io } from "../../server";
 import { CallStatus, Call } from "../../types";
+import { getPublicBaseUrl } from "../../utils/public-url";
 
 const router = Router();
 
@@ -19,11 +20,13 @@ router.get("/test", (req: Request, res: Response) => {
 
 // GET /api/webhooks/diagnostics - Diagnostic endpoint to check configuration
 router.get("/diagnostics", (req: Request, res: Response) => {
-  const publicUrl = process.env.PUBLIC_URL;
-  const hasPublicUrl = !!publicUrl;
+  const publicUrlEnv = process.env.PUBLIC_URL?.trim() || "";
+  const railwayDomain = process.env.RAILWAY_PUBLIC_DOMAIN?.trim() || "";
+  const publicUrl = getPublicBaseUrl();
+  const hasExplicitPublicUrl = !!publicUrlEnv;
 
-  let wsUrl = null;
-  let exampleStreamUrl = null;
+  let wsUrl: string | null = null;
+  let exampleStreamUrl: string | null = null;
   if (publicUrl) {
     wsUrl =
       publicUrl.replace("https://", "wss://").replace("http://", "ws://") +
@@ -35,26 +38,30 @@ router.get("/diagnostics", (req: Request, res: Response) => {
     success: true,
     timestamp: new Date().toISOString(),
     configuration: {
-      publicUrl: publicUrl || "NOT SET",
-      websocketUrl: wsUrl || "NOT SET (PUBLIC_URL required)",
-      exampleStreamUrl: exampleStreamUrl || "NOT SET (PUBLIC_URL required)",
-      hasPublicUrl,
+      PUBLIC_URL_env: publicUrlEnv || "NOT SET",
+      RAILWAY_PUBLIC_DOMAIN: railwayDomain || "NOT SET",
+      resolvedPublicUrl: publicUrl,
+      websocketUrl: wsUrl || "NOT SET",
+      exampleStreamUrl: exampleStreamUrl || "NOT SET",
+      hasExplicitPublicUrl,
     },
     warnings: [] as string[],
     errors: [] as string[],
     recommendations: [] as string[],
   };
 
-  if (!hasPublicUrl) {
-    diagnostics.errors.push("PUBLIC_URL environment variable is not set");
+  if (!hasExplicitPublicUrl && !railwayDomain) {
     diagnostics.errors.push(
-      "Twilio cannot connect to localhost - you must use ngrok, Cloudflare Tunnel, or a production server"
+      "PUBLIC_URL is not set (and RAILWAY_PUBLIC_DOMAIN not set) — Twilio webhooks default to localhost and will not work remotely",
+    );
+    diagnostics.errors.push(
+      "Twilio cannot connect to localhost - you must use ngrok, Cloudflare Tunnel, or a production server",
     );
     diagnostics.recommendations.push(
-      "Set PUBLIC_URL in backend/.env file to your public URL (e.g., https://your-ngrok-url.ngrok-free.app)"
+      "Set PUBLIC_URL to your deployed API origin (e.g. https://your-service.up.railway.app) with no trailing slash",
     );
   } else {
-    if (publicUrl?.includes("localhost") || publicUrl?.includes("127.0.0.1")) {
+    if (publicUrl.includes("localhost") || publicUrl.includes("127.0.0.1")) {
       diagnostics.errors.push(
         "PUBLIC_URL contains localhost - Twilio cannot reach this from the internet"
       );
@@ -63,7 +70,7 @@ router.get("/diagnostics", (req: Request, res: Response) => {
       );
     }
 
-    if (publicUrl?.includes("ngrok-free.app")) {
+    if (publicUrl.includes("ngrok-free.app") || /ngrok/i.test(publicUrl)) {
       diagnostics.warnings.push(
         "Using ngrok free tier - WebSocket support is LIMITED and may cause connection failures"
       );
@@ -81,23 +88,23 @@ router.get("/diagnostics", (req: Request, res: Response) => {
       );
     }
 
-    if (publicUrl?.includes("trycloudflare.com")) {
+    if (publicUrl.includes("trycloudflare.com")) {
       diagnostics.warnings.push(
         "Using Cloudflare Tunnel - this should work, but URLs change on restart"
       );
     }
 
     if (
-      !publicUrl?.startsWith("http://") &&
-      !publicUrl?.startsWith("https://")
+      !publicUrl.startsWith("http://") &&
+      !publicUrl.startsWith("https://")
     ) {
       diagnostics.errors.push("PUBLIC_URL must start with http:// or https://");
       diagnostics.recommendations.push(
-        `Current value: "${publicUrl}" - add the protocol prefix`
+        `Current value: "${publicUrl}" - add the protocol prefix`,
       );
     }
 
-    if (publicUrl?.endsWith("/")) {
+    if (publicUrl.endsWith("/")) {
       diagnostics.warnings.push(
         "PUBLIC_URL ends with a trailing slash - this may cause URL construction issues"
       );
@@ -290,16 +297,25 @@ router.post("/twilio/voice", (req: Request, res: Response) => {
       return res.send(errorTwiml);
     }
 
-    // Get base URL - must be the public ngrok URL for WebSocket connections
-    const baseUrl = process.env.PUBLIC_URL;
+    // Get base URL — must be a public HTTPS origin (e.g. Railway), not a stale ngrok tunnel.
+    const baseUrl = getPublicBaseUrl();
 
-    if (!baseUrl) {
-      console.error("❌ CRITICAL: PUBLIC_URL environment variable is not set!");
+    let voiceHostname = "";
+    try {
+      voiceHostname = new URL(baseUrl).hostname;
+    } catch {
+      voiceHostname = "";
+    }
+    if (
+      !voiceHostname ||
+      voiceHostname === "localhost" ||
+      voiceHostname === "127.0.0.1"
+    ) {
       console.error(
-        "❌ Twilio cannot connect to localhost. WebSocket will fail."
+        "❌ CRITICAL: Resolved PUBLIC_URL is missing or localhost — Twilio cannot reach your server.",
       );
       console.error(
-        "❌ Please set PUBLIC_URL in your .env file to your ngrok URL"
+        "❌ Set PUBLIC_URL to your deployed API (e.g. https://your-service.up.railway.app)",
       );
 
       const errorTwiml = `<?xml version="1.0" encoding="UTF-8"?>
@@ -434,7 +450,7 @@ router.post("/twilio/dtmf", (req: Request, res: Response) => {
     );
 
     // Get base URL for media stream
-    const baseUrl = process.env.PUBLIC_URL || "http://localhost:3001";
+    const baseUrl = getPublicBaseUrl();
     const wsUrl = baseUrl
       .replace("https://", "wss://")
       .replace("http://", "ws://");

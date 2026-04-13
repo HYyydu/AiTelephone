@@ -1,5 +1,6 @@
 // Configuration for the backend
 import dotenv from "dotenv";
+import { warnIfProductionPublicUrlLooksWrong } from "../utils/public-url";
 
 dotenv.config();
 
@@ -338,9 +339,10 @@ export function validateConfig() {
     console.log(`✅ PUBLIC_URL set: ${process.env.PUBLIC_URL}`);
   } else {
     console.warn(
-      "⚠️  PUBLIC_URL not set - using localhost (Twilio webhooks will not work)",
+      "⚠️  PUBLIC_URL not set - using localhost or RAILWAY_PUBLIC_DOMAIN (Twilio webhooks need a public HTTPS URL)",
     );
   }
+  warnIfProductionPublicUrlLooksWrong();
 
   if (process.env.ALLOW_NO_AUTH === "true") {
     console.warn(

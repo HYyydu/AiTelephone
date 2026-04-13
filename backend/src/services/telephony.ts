@@ -3,6 +3,7 @@ import twilio from 'twilio';
 import { config } from '../config';
 import { Call } from '../types';
 import { CallService } from '../database/services/call-service';
+import { getPublicBaseUrl } from '../utils/public-url';
 
 const twilioClient = twilio(config.twilio.accountSid, config.twilio.authToken);
 
@@ -37,7 +38,7 @@ export async function initiateCall(call: Call): Promise<void> {
     await CallService.updateCall(call.id, { status: 'calling' });
 
     // Webhooks must be public HTTPS (or at least non-localhost); use ngrok / tunnel in dev.
-    const baseUrl = (process.env.PUBLIC_URL || "http://localhost:3001").replace(/\/$/, "");
+    const baseUrl = getPublicBaseUrl();
     assertPublicWebhookBase(baseUrl);
     const statusCallbackUrl = `${baseUrl}/api/webhooks/twilio/status`;
     const voiceUrl = `${baseUrl}/api/webhooks/twilio/voice`;
@@ -97,7 +98,7 @@ export async function sendDTMF(callSid: string, digits: string): Promise<void> {
     console.log(`🔢 Sending DTMF tones: "${digits}" for call: ${callSid}`);
     
     // Get base URL for TwiML endpoint
-    const baseUrl = process.env.PUBLIC_URL || 'http://localhost:3001';
+    const baseUrl = getPublicBaseUrl();
     const dtmfUrl = `${baseUrl}/api/webhooks/twilio/dtmf?digits=${encodeURIComponent(digits)}&callSid=${callSid}`;
     
     // Redirect the call to a TwiML endpoint that plays the DTMF digits
