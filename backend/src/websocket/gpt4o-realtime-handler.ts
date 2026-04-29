@@ -54,7 +54,6 @@ const TIMING_THRESHOLDS = {
   SPEECH_SUSPECTED_LOG_THROTTLE_MS: 2000,
   MIN_SPEECH_INTERVAL_MS: 100,
   MIN_TRANSCRIPT_LENGTH: 2,
-  CONVERSATION_WINDOW_MS: 1000, // Wait 1 second of silence before responding to accumulated user speech
 } as const;
 
 const AUDIO_BUFFER_LIMITS = {
@@ -194,7 +193,15 @@ Assistant: Not really, I'm always here.
 - Favor short, natural-sounding phrases.
 - Break up longer responses across multiple user turns.
 - Use previous user names and context for continuity and natural style.
-- Add subtle non-verbal vocal touches when appropriate (light laughter, slight sigh, etc.).`;
+- Add subtle non-verbal vocal touches when appropriate (light laughter, slight sigh, etc.).
+
+### Language policy (strict)
+- Default language: English.
+- Keep speaking English unless the caller clearly switches to another language.
+- "Clearly switches" means a complete phrase/sentence in another language (not just one word or a name).
+- If the caller clearly switches language, mirror that language for replies.
+- If unsure, stay in English.
+- Never switch languages on your own.`;
 
 /**
  * GPT-4o-Realtime Handler for bidirectional audio streaming
@@ -283,7 +290,7 @@ export class GPT4oRealtimeHandler {
   private readonly VAD_HISTORY_SIZE = 250; // 5 seconds at 20ms/frame
   private callState = new CallStateManager();
   private lastHoldCheckTime: number = 0;
-  private conversationWindowTimer: NodeJS.Timeout | null = null; // Timer to wait for 1 second of silence before responding
+  private conversationWindowTimer: NodeJS.Timeout | null = null; // Debounce after last transcript chunk (see config.openai.conversationWindowMs)
   private lastTranscriptTime: number = 0; // Timestamp of the last transcript received
   private holdTimeoutTimer: NodeJS.Timeout | null = null; // Phase 3: max ON_HOLD duration (CALL_HOLD_TIMEOUT_MS)
   /** Phase 5: normalized transcripts for repeated-announcement detection */
@@ -340,6 +347,7 @@ export class GPT4oRealtimeHandler {
   /** Keys from `threshold.toFixed(4)` so quota_warning fires once per tier. */
   private usageWarningThresholdsSent = new Set<string>();
   private tokenBudgetHangupStarted = false;
+  private hasSentFirstAssistantUtterance = false;
 
   constructor(ws: WebSocket) {
     this.ws = ws;
@@ -388,7 +396,7 @@ export class GPT4oRealtimeHandler {
         model:
           config.openai.realtimeModel || "gpt-4o-realtime-preview-2024-12-17",
         voice: this.getVoiceFromPreference(),
-        temperature: config.openai.temperature,
+        temperature: config.openai.realtimeTemperature,
         max_response_output_tokens: 4096,
       });
 
@@ -432,6 +440,44 @@ export class GPT4oRealtimeHandler {
     );
   }
 
+  private extractTaggedSection(
+    text: string,
+    tag: string,
+  ): string | undefined {
+    const m = text.match(
+      new RegExp(`\\[\\[${tag}\\]\\]([\\s\\S]*?)\\[\\[\\/${tag}\\]\\]`, "i"),
+    );
+    const value = m?.[1]?.trim();
+    return value ? value : undefined;
+  }
+
+  private stripStructuredTags(text: string): string {
+    return text
+      .replace(/\[\[[A-Z_]+]]/g, "")
+      .replace(/\[\[\/[A-Z_]+]]/g, "")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
+  }
+
+  private getStructuredPromptContext(raw: string): {
+    agentPrompt?: string;
+    openingLine?: string;
+    talkingPoints: string[];
+    callBrief?: string;
+  } {
+    const talkingRaw = this.extractTaggedSection(raw, "TALKING_POINTS") || "";
+    const talkingPoints = talkingRaw
+      .split("\n")
+      .map((line) => line.replace(/^\d+\.\s*/, "").trim())
+      .filter(Boolean);
+    return {
+      agentPrompt: this.extractTaggedSection(raw, "AGENT_PROMPT"),
+      openingLine: this.extractTaggedSection(raw, "OPENING_LINE"),
+      talkingPoints,
+      callBrief: this.extractTaggedSection(raw, "CALL_BRIEF"),
+    };
+  }
+
   private buildSystemPrompt(): string {
     if (
       usesPriceGatheringCallBehavior(
@@ -443,14 +489,16 @@ export class GPT4oRealtimeHandler {
     }
     const purpose = this.call.purpose || "";
     const additionalContext = this.call.additional_instructions || "";
-    const fullText = (purpose + " " + additionalContext).toLowerCase();
+    const structured = this.getStructuredPromptContext(additionalContext);
+    const additionalContextPlain = this.stripStructuredTags(additionalContext);
+    const fullText = (purpose + " " + additionalContextPlain).toLowerCase();
 
     // Parse tone preference
-    const toneMatch = additionalContext.match(/tone[:\s]+(polite|firm)/i);
+    const toneMatch = additionalContextPlain.match(/tone[:\s]+(polite|firm)/i);
     const communicationTone = toneMatch ? toneMatch[1].toLowerCase() : "polite";
 
     // Use explicit call name from API, or extract from purpose/instructions, or default
-    const nameMatch = (purpose + " " + additionalContext).match(
+    const nameMatch = (purpose + " " + additionalContextPlain).match(
       /(?:user|name|customer)[:\s]+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)/i,
     );
     const extractedName = nameMatch ? nameMatch[1] : null;
@@ -464,13 +512,13 @@ export class GPT4oRealtimeHandler {
       (this.call.name && this.call.name.trim()) || parsedName || "Holdless";
 
     // Extract order number (look for patterns like "Order Number: 12345", "order number 12345", "order #12345")
-    const orderNumberMatch = (purpose + " " + additionalContext).match(
+    const orderNumberMatch = (purpose + " " + additionalContextPlain).match(
       /order\s*(?:number|#)?\s*:?\s*([A-Z0-9\-]+)/i,
     );
     const orderNumber = orderNumberMatch ? orderNumberMatch[1].trim() : null;
 
     // Extract company name (look for patterns like "Customer needs help with Amazon", "Company: Amazon", etc.)
-    const companyMatch = (purpose + " " + additionalContext).match(
+    const companyMatch = (purpose + " " + additionalContextPlain).match(
       /(?:customer needs help with|company|with)\s+([A-Z][a-zA-Z\s]+?)(?:\s*\.|,|Issue|Order|Desired|$)/i,
     );
     let companyName = companyMatch ? companyMatch[1].trim() : null;
@@ -482,7 +530,7 @@ export class GPT4oRealtimeHandler {
     }
 
     // Extract desired outcome
-    const outcomeMatch = (purpose + " " + additionalContext).match(
+    const outcomeMatch = (purpose + " " + additionalContextPlain).match(
       /(?:desired outcome|outcome)[:\s]+(.+?)(?:\s*\.|,|$|Order)/i,
     );
     let desiredOutcome = outcomeMatch ? outcomeMatch[1].trim() : null;
@@ -510,7 +558,7 @@ export class GPT4oRealtimeHandler {
 
     // If no issue description found, try to extract from purpose directly
     if (!issueDescription) {
-      const issueMatch = (purpose + " " + additionalContext).match(
+      const issueMatch = (purpose + " " + additionalContextPlain).match(
         /(?:issue|item|product)[:\s]+(.+?)(?:\s*\.|,|Order|Desired|$)/i,
       );
       issueDescription = issueMatch ? issueMatch[1].trim() : null;
@@ -542,13 +590,13 @@ export class GPT4oRealtimeHandler {
       : null;
 
     // Extract email address
-    const emailMatch = (purpose + " " + additionalContext).match(
+    const emailMatch = (purpose + " " + additionalContextPlain).match(
       /email\s*(?:address)?\s*:?\s*([a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,})/i,
     );
     const emailAddress = emailMatch ? emailMatch[1].trim() : null;
 
     // Extract phone number
-    const phoneMatch = (purpose + " " + additionalContext).match(
+    const phoneMatch = (purpose + " " + additionalContextPlain).match(
       /phone\s*(?:number)?\s*:?\s*([+]?[\d\s\-()]+)/i,
     );
     const phoneNumber = phoneMatch ? phoneMatch[1].trim() : null;
@@ -565,6 +613,14 @@ You are ${userName}, a CUSTOMER who wants a refund/help. You are NOT customer se
 The HUMAN on the call is the CUSTOMER SERVICE REPRESENTATIVE who will help you.
 
 ${REALTIME_SPEECH_STYLE_INSTRUCTIONS}
+
+HIGHEST PRIORITY RUNTIME OVERRIDES:
+- Always speak in first-person singular ("I"), never "we".
+- Do not proactively provide due dates or service dates unless asked directly or absolutely required to answer.
+${structured.agentPrompt ? `- Follow this custom agent prompt with highest priority:\n${structured.agentPrompt}` : ""}
+${structured.callBrief ? `- Call brief:\n${structured.callBrief}` : ""}
+${structured.talkingPoints.length > 0 ? `- Ordered talking points (cover in order unless the representative asks to jump):\n${structured.talkingPoints.map((p, i) => `  ${i + 1}. ${p}`).join("\n")}` : ""}
+${structured.openingLine ? `- First assistant turn requirement: your FIRST spoken reply in this call must follow this opening line intent exactly:\n"${structured.openingLine}"` : ""}
 
 ROLE BREAKDOWN:
 - YOU (AI): CUSTOMER - You request refunds, ask for help, need assistance. You say things like "I need", "I'd like", "Can you help", "My order arrived damaged"
@@ -689,6 +745,13 @@ When they ask how they can help or what happened, use: "Hi! My name is ${userNam
 CRITICAL INTRODUCTION RULES:
 - Make it natural and conversational - speak like a real customer, not a robot listing fields
 - Do NOT say: "Customer needs help with... Issue Type:... Order Number:... Desired Outcome:..."
+- Rewrite raw objective text into fluent spoken English before saying it out loud.
+- Never read labels or fragments literally (e.g., "purpose:", "request:", "objective:", "constraints:", "call brief:").
+- If the source text is ungrammatical, fix grammar and wording while preserving meaning.
+- Prefer natural phrasing like:
+  - "I'm calling because I need help disputing a billing charge from Pine Valley Medical Center."
+  - "I'm hoping to reduce the total amount on the bill."
+- Avoid awkward constructions like "about dispute a billing issue" or "and request: try your best in minimizing the cost."
 - After a bare greeting from them, keep it short (name + calling about an order). When they ask how they can help, THEN say: "Hi, my name is [name]. I'm calling because I need help with [company] order. My [item] arrived damaged. I'd like to request a [outcome]."
 - If you have an order number, include it ONLY when:
   1. They ask "How can I help you?" or similar questions
@@ -700,7 +763,7 @@ CRITICAL INTRODUCTION RULES:
 
 YOUR INFORMATION:
 - Purpose: ${purpose}
-${additionalContext ? `- Additional context: ${additionalContext}` : ""}
+${additionalContextPlain ? `- Additional context: ${additionalContextPlain}` : ""}
 - Name: ${userName}
 - Tone: ${communicationTone}
 ${
@@ -906,15 +969,25 @@ CALL ENDING - CRITICAL:
 
   private buildPriceInquirySystemPrompt(): string {
     const purpose = (this.call.purpose || "").trim();
-    const extra = stripQuoteCallMarker(
+    const extraRaw = stripQuoteCallMarker(
       (this.call.additional_instructions || "").trim(),
     );
+    const structured = this.getStructuredPromptContext(extraRaw);
+    const extra = this.stripStructuredTags(extraRaw);
     const callerRules = getQuoteCallerInstructions();
     const factLines = [purpose, extra].filter((s) => s.length > 0);
     const factsBlock = factLines.join("\n\n");
     return `${REALTIME_SPEECH_STYLE_INSTRUCTIONS}
 
 ${callerRules}
+
+HIGHEST PRIORITY RUNTIME OVERRIDES:
+- Always speak in first-person singular ("I"), never "we".
+- Do not proactively provide due dates or service dates unless asked directly or absolutely required to answer.
+${structured.agentPrompt ? `- Follow this custom agent prompt with highest priority:\n${structured.agentPrompt}` : ""}
+${structured.callBrief ? `- Call brief:\n${structured.callBrief}` : ""}
+${structured.talkingPoints.length > 0 ? `- Ordered talking points (cover in order unless the representative asks to jump):\n${structured.talkingPoints.map((p, i) => `  ${i + 1}. ${p}`).join("\n")}` : ""}
+${structured.openingLine ? `- First assistant turn requirement: your FIRST spoken reply in this call must follow this opening line intent exactly:\n"${structured.openingLine}"` : ""}
 
 AUTHORITATIVE FACTS — you may ONLY claim what appears here; nothing else:
 ${factsBlock}
@@ -1814,7 +1887,7 @@ CALL FLOW:
   }
 
   /**
-   * Handle accumulated transcript response after 1 second of silence
+   * Handle accumulated transcript after the conversation debounce (OPENAI_CONVERSATION_WINDOW_MS).
    */
   private handleAccumulatedTranscriptResponse(): void {
     if (this.callState.isOnHold()) {
@@ -1830,7 +1903,7 @@ CALL FLOW:
 
     const finalTranscript = this.accumulatedTranscript.trim();
     console.log(
-      `📝📝📝 RESPONDING TO ACCUMULATED TRANSCRIPT (1s silence detected): "${finalTranscript}" 📝📝📝`,
+      `📝📝📝 RESPONDING TO ACCUMULATED TRANSCRIPT (${config.openai.conversationWindowMs}ms silence debounce): "${finalTranscript}" 📝📝📝`,
     );
 
     // 🚨 CRITICAL: Verify this is still the most recent user input
@@ -1840,11 +1913,9 @@ CALL FLOW:
         ? Date.now() - this.lastTranscriptTime
         : Infinity;
 
-    // If there's been new speech very recently (< 1 second), this accumulated transcript may be stale
-    // But if it's been 3+ seconds (our conversation window), it should be safe to respond
-    // The timer only fires after 1 second of silence, so if lastTranscriptTime is recent,
-    // it means new speech came in after the timer started but before it fired
-    if (timeSinceLastTranscript < 1000 && this.lastTranscriptTime > 0) {
+    // If there's been new speech very recently (within the debounce window), this accumulated transcript may be stale
+    const cw = config.openai.conversationWindowMs;
+    if (timeSinceLastTranscript < cw && this.lastTranscriptTime > 0) {
       console.log(
         `⚠️⚠️⚠️ POTENTIALLY STALE ACCUMULATED TRANSCRIPT - User spoke ${timeSinceLastTranscript}ms ago ⚠️⚠️⚠️`,
       );
@@ -1879,7 +1950,7 @@ CALL FLOW:
     }
 
     // Keypad IVR: do not ask the LLM to "press" anything (speech ≠ DTMF). Transcript save already
-    // scheduled debounced DTMF; the 1s silence path must not race ahead and speak "1." etc.
+    // scheduled debounced DTMF; the conversation debounce path must not race ahead and speak "1." etc.
     if (
       config.call.ivrDtmf.enabled &&
       transcriptLooksLikeIvrPrompt(finalTranscript)
@@ -2155,7 +2226,20 @@ CALL FLOW:
       console.log(
         `🔄🔄🔄 REQUESTING AI RESPONSE - ONLY TO LATEST USER INPUT: "${userTranscript}" 🔄🔄🔄`,
       );
-      this.realtimeConnection.requestResponse();
+      const openingLine = this.getStructuredPromptContext(
+        this.call.additional_instructions || "",
+      ).openingLine;
+      if (!this.hasSentFirstAssistantUtterance && openingLine) {
+        const firstTurnInstructions = `This is your first spoken reply on this call. Use this opening line intent exactly, then continue naturally only if needed: "${openingLine}"`;
+        console.log(
+          "🎯 Enforcing opening_line for first assistant turn via response instructions",
+        );
+        this.realtimeConnection.requestResponseWithInstructions(
+          firstTurnInstructions,
+        );
+      } else {
+        this.realtimeConnection.requestResponse();
+      }
     }, responseDelay);
   }
 
@@ -2172,7 +2256,7 @@ CALL FLOW:
   private handleInterruptionPhrase(
     userTranscript: string,
     transcriptionTime: number,
-  ): void {
+  ): boolean {
     const timeSinceResponseStart = this.getTimeSinceResponseStart();
     const aiIsSpeaking =
       this.isProcessingResponse && this.responseStartTime > 0;
@@ -2196,7 +2280,7 @@ CALL FLOW:
       // Just update the timestamp and continue normally
       this.latestUserSpeechTimestamp = transcriptionTime;
       this.suspectedSpeech = false;
-      return; // Exit early - don't treat as interruption
+      return false; // Not a real interruption; continue normal user-turn handling
     }
 
     // 🚨 Add Minimum Interruption Delay (Fix the Whisper Race)
@@ -2207,7 +2291,7 @@ CALL FLOW:
       );
       this.latestUserSpeechTimestamp = transcriptionTime;
       this.suspectedSpeech = false;
-      return;
+      return false;
     }
 
     // If AI has started speaking, this is a true interruption
@@ -2233,6 +2317,7 @@ CALL FLOW:
     console.log(
       "🛑 Cancelled AI response due to interruption phrase - will remain silent",
     );
+    return true;
   }
 
   /**
@@ -3157,6 +3242,10 @@ CALL FLOW:
 
         case "response.audio.done":
           console.log("✅ AI audio response complete");
+          if (!this.hasSentFirstAssistantUtterance) {
+            this.hasSentFirstAssistantUtterance = true;
+            console.log("✅ First assistant utterance completed");
+          }
           this.currentResponseAudioDone = true; // Mark that audio generation is complete for current response
           // Don't set isProcessingResponse to false here - wait for response.done
           break;
@@ -3225,11 +3314,10 @@ CALL FLOW:
               !this.callState.isOnHold()
             ) {
               console.log(
-                `📝 AI finished speaking - starting 1-second timer for accumulated transcript: "${this.accumulatedTranscript}"`,
+                `📝 AI finished speaking - starting ${config.openai.conversationWindowMs}ms debounce timer for accumulated transcript: "${this.accumulatedTranscript}"`,
               );
               // Clear any existing timer
               this.clearConversationWindowTimer();
-              // Start the 1-second timer
               this.conversationWindowTimer = setTimeout(() => {
                 this.conversationWindowTimer = null;
                 if (this.callState.isOnHold()) {
@@ -3239,10 +3327,10 @@ CALL FLOW:
                   return;
                 }
                 console.log(
-                  `⏱️  1 second of silence detected after AI finished - processing accumulated transcript`,
+                  `⏱️  Conversation debounce elapsed after AI finished - processing accumulated transcript`,
                 );
                 this.handleAccumulatedTranscriptResponse();
-              }, TIMING_THRESHOLDS.CONVERSATION_WINDOW_MS);
+              }, config.openai.conversationWindowMs);
               break; // Exit early - don't use old logic
             } else if (
               this.accumulatedTranscript.trim() &&
@@ -3688,14 +3776,22 @@ CALL FLOW:
           // If it's an interruption phrase, allow it through immediately (bypass echo suppression)
           // This works even during echo periods because interruption phrases indicate real user intent
           if (isInterruptionPhrase) {
-            this.handleInterruptionPhrase(userTranscript, transcriptionTime);
-            // Save transcript but DO NOT request a response - wait for user to finish speaking
-            await this.saveTranscript("human", userTranscript);
-            this.touchUserIdleActivity();
-            console.log(
-              "🔇 Interruption detected - remaining silent and waiting for user to finish",
+            const interruptedNow = this.handleInterruptionPhrase(
+              userTranscript,
+              transcriptionTime,
             );
-            break; // Exit early - don't request a response
+            if (interruptedNow) {
+              // Real interruption while AI is speaking: save transcript but don't request response yet.
+              await this.saveTranscript("human", userTranscript);
+              this.touchUserIdleActivity();
+              console.log(
+                "🔇 Interruption detected - remaining silent and waiting for user to finish",
+              );
+              break; // Exit early - don't request a response
+            }
+            console.log(
+              'ℹ️  Interruption-like phrase heard while AI was silent; treating as normal user turn',
+            );
           }
 
           // For non-interruption phrases: Check if this is real user speech or echo
@@ -4391,7 +4487,7 @@ CALL FLOW:
                 : Infinity;
 
             if (
-              timeSinceLastTranscript < TIMING_THRESHOLDS.CONVERSATION_WINDOW_MS
+              timeSinceLastTranscript < config.openai.conversationWindowMs
             ) {
               // This is a continuation - accumulate it
               if (this.accumulatedTranscript) {
@@ -4448,7 +4544,7 @@ CALL FLOW:
               : Infinity;
 
           if (
-            timeSinceLastTranscript < TIMING_THRESHOLDS.CONVERSATION_WINDOW_MS
+            timeSinceLastTranscript < config.openai.conversationWindowMs
           ) {
             // This is a continuation - accumulate it
             console.log(
@@ -4486,14 +4582,13 @@ CALL FLOW:
 
           if (this.callState.isOnHold()) {
             console.log(
-              "⏸️  ON_HOLD — not starting 1s silence timer for accumulated speech",
+              "⏸️  ON_HOLD — not starting conversation debounce timer for accumulated speech",
             );
             break;
           }
 
-          // Start/reset the 1-second timer
           console.log(
-            `⏱️  Starting 1-second silence timer (will respond if no more speech)`,
+            `⏱️  Starting ${config.openai.conversationWindowMs}ms debounce timer (will respond if no more transcript chunks)`,
           );
           this.conversationWindowTimer = setTimeout(() => {
             this.conversationWindowTimer = null;
@@ -4504,14 +4599,13 @@ CALL FLOW:
               return;
             }
             console.log(
-              `⏱️  1 second of silence detected - processing accumulated transcript`,
+              `⏱️  Conversation debounce elapsed - processing accumulated transcript`,
             );
             this.handleAccumulatedTranscriptResponse();
-          }, TIMING_THRESHOLDS.CONVERSATION_WINDOW_MS);
+          }, config.openai.conversationWindowMs);
 
-          // Don't request response immediately - wait for 1 second of silence
           console.log(
-            `⏸️  Waiting for 1 second of silence before responding to accumulated speech`,
+            `⏸️  Waiting ${config.openai.conversationWindowMs}ms after last transcript chunk before responding`,
           );
           break;
 

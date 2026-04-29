@@ -14,6 +14,11 @@ export type FreeCallConsumeResult = {
   remaining: number;
 };
 
+export type FreeCallQuotaSnapshot = {
+  limit: number;
+  used: number;
+};
+
 /**
  * Convert database call record to Call interface
  */
@@ -28,6 +33,7 @@ function dbCallToCall(dbCall: typeof calls.$inferSelect): Call {
     created_at: dbCall.created_at || new Date(),
     started_at: dbCall.started_at || undefined,
     ended_at: dbCall.ended_at || undefined,
+    user_joined_at: dbCall.user_joined_at || undefined,
     duration_seconds: dbCall.duration || undefined,
     call_sid: dbCall.call_sid || undefined,
     recording_url: dbCall.recording_url || undefined,
@@ -53,6 +59,7 @@ function callToDbCall(call: Call): typeof calls.$inferInsert {
     created_at: call.created_at,
     started_at: call.started_at || null,
     ended_at: call.ended_at || null,
+    user_joined_at: call.user_joined_at || null,
     duration: call.duration_seconds || null,
     call_sid: call.call_sid || null,
     recording_url: call.recording_url || null,
@@ -96,6 +103,43 @@ function transcriptToDbTranscript(transcript: Transcript): typeof transcripts.$i
  * Call service - handles all database operations for calls
  */
 export class CallService {
+  private static async consumeFreeCallRequestFallback(
+    userId: string,
+  ): Promise<FreeCallConsumeResult> {
+    const result = await db.execute<FreeCallConsumeResultRow>(
+      sql`
+        with ensured as (
+          insert into public.users (id, email)
+          values (${userId}::uuid, concat('trial+', ${userId}::text, '@placeholder.local'))
+          on conflict (id) do nothing
+        ),
+        consumed as (
+          update public.users
+          set free_call_used = free_call_used + 1
+          where id = ${userId}::uuid
+            and free_call_used < free_call_limit
+          returning free_call_limit, free_call_used
+        )
+        select true as allowed, greatest(free_call_limit - free_call_used, 0)::integer as remaining
+        from consumed
+        union all
+        select false as allowed, 0 as remaining
+        where not exists (select 1 from consumed)
+        limit 1;
+      `,
+    );
+
+    const row = result.rows[0];
+    if (!row) {
+      throw new Error("free-call fallback query returned no rows");
+    }
+
+    return {
+      allowed: row.allowed,
+      remaining: row.remaining,
+    };
+  }
+
   /**
    * Atomically consume one free trial call request for a user.
    */
@@ -107,7 +151,10 @@ export class CallService {
 
       const row = result.rows[0];
       if (!row) {
-        throw new Error('consume_free_call_request returned no rows');
+        console.warn(
+          "consume_free_call_request returned no rows; using SQL fallback",
+        );
+        return this.consumeFreeCallRequestFallback(userId);
       }
 
       return {
@@ -115,8 +162,42 @@ export class CallService {
         remaining: row.remaining,
       };
     } catch (error) {
-      console.error('Error consuming free call request:', error);
-      throw error;
+      console.error(
+        "Error consuming free call request via RPC, using SQL fallback:",
+        error,
+      );
+      return this.consumeFreeCallRequestFallback(userId);
+    }
+  }
+
+  /**
+   * Read free-call quota counters for diagnostics/logging.
+   */
+  static async getFreeCallQuotaSnapshot(
+    userId: string,
+  ): Promise<FreeCallQuotaSnapshot | undefined> {
+    try {
+      const result = await db.execute<{ free_call_limit: number; free_call_used: number }>(
+        sql`
+          select free_call_limit, free_call_used
+          from public.users
+          where id = ${userId}::uuid
+          limit 1;
+        `,
+      );
+
+      const row = result.rows[0];
+      if (!row) {
+        return undefined;
+      }
+
+      return {
+        limit: row.free_call_limit,
+        used: row.free_call_used,
+      };
+    } catch (error) {
+      console.error("Error reading free call quota snapshot:", error);
+      return undefined;
     }
   }
 
@@ -214,6 +295,7 @@ export class CallService {
       if (updates.additional_instructions !== undefined) dbUpdates.additional_instructions = updates.additional_instructions;
       if (updates.input_tokens !== undefined) dbUpdates.input_tokens = updates.input_tokens;
       if (updates.output_tokens !== undefined) dbUpdates.output_tokens = updates.output_tokens;
+      if (updates.user_joined_at !== undefined) dbUpdates.user_joined_at = updates.user_joined_at;
 
       const [updated] = await db
         .update(calls)

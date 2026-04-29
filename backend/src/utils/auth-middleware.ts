@@ -66,8 +66,9 @@ export async function authenticateUser(
 }
 
 /**
- * When CALL_API_TOKEN is set, validates Authorization: Bearer <token> against it and sets req.user.
- * Otherwise passes through so authenticateUser + requireAuth handle Supabase JWT.
+ * Optional server-to-server auth shortcut:
+ * - If CALL_API_TOKEN is set and Bearer token matches it, attach API user.
+ * - Otherwise pass through so authenticateUser can validate a Supabase JWT.
  */
 export function authenticateCallApiToken(
   req: Request,
@@ -81,21 +82,17 @@ export function authenticateCallApiToken(
 
   const auth = req.headers.authorization;
 
-  if (!auth) {
-    res.status(401).json({
-      success: false,
-      error: "Authentication required",
-    });
+  if (!auth || !auth.startsWith("Bearer ")) {
+    next();
     return;
   }
 
   const token = auth.split(" ")[1];
 
   if (token !== config.auth.callApiToken) {
-    res.status(403).json({
-      success: false,
-      error: "Invalid token",
-    });
+    // Not the API token: fall through to Supabase auth middleware.
+    // If it's not a valid Supabase JWT either, requireAuth will reject later.
+    next();
     return;
   }
 

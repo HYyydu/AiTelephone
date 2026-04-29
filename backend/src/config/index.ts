@@ -33,6 +33,12 @@ export const config = {
     frequencyPenalty: parseFloat(process.env.OPENAI_FREQUENCY_PENALTY || "0.5"),
     presencePenalty: parseFloat(process.env.OPENAI_PRESENCE_PENALTY || "0.3"),
     temperature: parseFloat(process.env.OPENAI_TEMPERATURE || "0.7"),
+    // Realtime generation temperature: lower than chat default for more stable live-call behavior
+    realtimeTemperature: parseFloat(
+      process.env.OPENAI_REALTIME_TEMPERATURE ||
+        process.env.OPENAI_TEMPERATURE ||
+        "0.6",
+    ),
     // Realtime API speech detection settings (MAXIMUM SENSITIVITY - detects user speech immediately)
     // VAD threshold: Lower = more sensitive (default: 0.05 = MAXIMUM sensitivity, range: 0.05-0.2)
     // 0.05 detects even quiet speech immediately - stops AI as soon as user speaks
@@ -40,12 +46,12 @@ export const config = {
     // Prefix padding: Audio buffer before speech start (default: 50ms = MAXIMUM speed, range: 50-200ms)
     // 50ms = fastest detection - catches speech as early as possible
     prefixPaddingMs: parseInt(process.env.OPENAI_PREFIX_PADDING_MS || "50", 10),
-    // Silence duration: Wait time after speech ends before AI can respond (default: 2000ms = gives user more time, range: 500-5000ms)
-    // Higher values = AI waits longer after user stops speaking, giving user more time to continue
-    // 2000ms = 2 seconds - gives user comfortable time to pause and continue speaking
-    silenceDurationMs: parseInt(
-      process.env.OPENAI_SILENCE_DURATION_MS || "2000",
-      10,
+    // Silence duration: wait after speech end before turn completion.
+    // For phone calls we cap this low to avoid dead air and keep turn-taking snappy.
+    // Default 180ms; max enforced 250ms (~sub-300ms perceived response target).
+    silenceDurationMs: Math.min(
+      250,
+      Math.max(80, parseInt(process.env.OPENAI_SILENCE_DURATION_MS || "180", 10)),
     ),
     // Response delay: Delay before requesting AI response (default: 0ms = immediate, range: 0-300ms)
     // 0ms = immediate response - AI responds instantly to user's question
@@ -56,6 +62,15 @@ export const config = {
       process.env.OPENAI_ECHO_GRACE_PERIOD_MS || "0",
       10,
     ),
+    /** Debounce after last transcript chunk before response.create. Hard-capped to 250ms to avoid audible silence. */
+    conversationWindowMs:
+      Math.max(
+        0,
+        Math.min(
+          250,
+          parseInt(process.env.OPENAI_CONVERSATION_WINDOW_MS || "120", 10) || 120,
+        ),
+      ),
   },
 
   // Deepgram configuration

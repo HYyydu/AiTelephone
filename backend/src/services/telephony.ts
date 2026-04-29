@@ -123,3 +123,64 @@ export function isConfigured(): boolean {
   );
 }
 
+/** Conference room name for a call; must match aicc-<uuid> so webhooks can validate. */
+const CONFERENCE_ROOM_RE = /^aicc-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+export function conferenceRoomNameForCallId(callId: string): string {
+  return `aicc-${callId.toLowerCase()}`;
+}
+
+export function isValidConferenceRoomName(room: string | undefined | null): boolean {
+  if (!room || typeof room !== "string") return false;
+  return CONFERENCE_ROOM_RE.test(room.trim());
+}
+
+/**
+ * Redirects the (business) leg away from the Media Stream into a named Twilio conference,
+ * then dials the **end user** into the same room. The stream disconnect stops the OpenAI Realtime
+ * path for that leg; cleanup runs in the media WebSocket handler.
+ *
+ * `userE164` is the only destination for the second leg — the client's join payload (e.g. profile
+ * phone). It must **not** be the CSR/business `phone_number` on the call record.
+ */
+export async function connectUserToOngoingConference(
+  call: { id: string; call_sid?: string | null },
+  userE164: string,
+): Promise<{ user_leg_call_sid: string }> {
+  if (!call.call_sid?.trim()) {
+    throw new Error("Call has no Twilio CallSid yet");
+  }
+
+  const baseUrl = getPublicBaseUrl();
+  assertPublicWebhookBase(baseUrl);
+
+  const room = conferenceRoomNameForCallId(call.id);
+  const confUrl = `${baseUrl}/api/webhooks/twilio/conference-join?room=${encodeURIComponent(room)}`;
+
+  await twilioClient.calls(call.call_sid).update({
+    url: confUrl,
+    method: "POST",
+  });
+
+  console.log(
+    `🤝 User join: business leg ${call.call_sid} redirected to conference room ${room} (AI stream will stop)`,
+  );
+
+  const out = await twilioClient.calls.create({
+    to: userE164,
+    from: config.twilio.phoneNumber,
+    url: confUrl,
+    method: "POST",
+  });
+
+  if (!out.sid) {
+    throw new Error("Twilio did not return a new call SID for the user leg");
+  }
+
+  console.log(
+    `🤝 User join: outbound to user leg ${out.sid} (same room ${room})`,
+  );
+
+  return { user_leg_call_sid: out.sid };
+}
+

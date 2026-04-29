@@ -18,7 +18,9 @@ export function getQuoteCallerInstructions(): string {
   return QUOTE_CALLER_INSTRUCTIONS;
 }
 
-export function isQuoteCall(additionalInstructions: string | null | undefined): boolean {
+export function isQuoteCall(
+  additionalInstructions: string | null | undefined,
+): boolean {
   return Boolean(additionalInstructions?.trim().startsWith(QUOTE_CALL_MARKER));
 }
 
@@ -44,7 +46,9 @@ export function isPriceOnlyInformationGatheringCall(
   const combined = `${purpose.trim()} ${extra}`.toLowerCase();
 
   const priceIntent =
-    /\b(price|pricing|quote|quoted|cost|how much|fees?\b|rate for|rates for)\b/.test(combined) ||
+    /\b(price|pricing|quote|quoted|cost|how much|fees?\b|rate for|rates for)\b/.test(
+      combined,
+    ) ||
     /\b(get|find|obtain|asking|ask about|ask for)\b[\s\S]{0,60}\b(price|pricing|quote|cost|how much)\b/.test(
       combined,
     );
@@ -52,7 +56,9 @@ export function isPriceOnlyInformationGatheringCall(
   if (!priceIntent) return false;
 
   const bookingIntent =
-    /\b(book|schedule|set up|make)\s+(an\s+)?(appointment|visit|slot)\b/.test(combined) ||
+    /\b(book|schedule|set up|make)\s+(an\s+)?(appointment|visit|slot)\b/.test(
+      combined,
+    ) ||
     /\b(schedule|book)\b[\s\S]{0,50}\b(appointment|visit)\b/.test(combined);
 
   return !bookingIntent;
@@ -63,5 +69,8 @@ export function usesPriceGatheringCallBehavior(
   purpose: string,
   additionalInstructions: string | null | undefined,
 ): boolean {
-  return isQuoteCall(additionalInstructions) || isPriceOnlyInformationGatheringCall(purpose, additionalInstructions);
+  return (
+    isQuoteCall(additionalInstructions) ||
+    isPriceOnlyInformationGatheringCall(purpose, additionalInstructions)
+  );
 }

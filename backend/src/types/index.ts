@@ -49,6 +49,8 @@ export interface Call {
   created_at: Date;
   started_at?: Date;
   ended_at?: Date;
+  /** Set when the user (account owner) joined the same conference as the business line; AI media stream for that call ended. */
+  user_joined_at?: Date;
   duration_seconds?: number;
   recording_url?: string;
   call_sid?: string;
@@ -73,9 +75,18 @@ export interface Transcript {
 export interface CreateCallRequest {
   phone_number: string;
   purpose: string;
+  agent_prompt?: string;
   name?: string; // Optional. Name for the AI to use: "Hi! My name is {name}. I'm calling..."
   voice_preference?: VoiceType;
   additional_instructions?: string;
+  opening_line?: string;
+  talking_points?: string[];
+  call_brief?: {
+    objective?: string;
+    must_ask?: string[];
+    preferences?: string[];
+    constraints?: string[];
+  };
 }
 
 export interface CallResponse {
@@ -137,6 +148,11 @@ export interface WebSocketEvents {
     message: string;
     used_tokens: number;
     limit_tokens: number;
+  };
+  /** User was dialed into the Twilio conference; AI Realtime on the business leg is stopped. */
+  human_joined: {
+    call_id: string;
+    joined_at: string;
   };
 }
 

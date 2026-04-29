@@ -335,6 +335,7 @@ router.post('/signout', async (req: Request, res: Response) => {
 // GET /api/auth/me - Get current user
 router.get('/me', async (req: Request, res: Response) => {
   try {
+    const requestId = (req as Request & { requestId?: string }).requestId;
     const token = req.headers.authorization?.replace('Bearer ', '');
 
     if (!token) {
@@ -348,11 +349,32 @@ router.get('/me', async (req: Request, res: Response) => {
     const user = await verifyAuthToken(token);
     
     if (!user) {
+      console.log(
+        JSON.stringify({
+          event: "auth_me_identity_resolved",
+          endpoint: "/api/auth/me",
+          request_id: requestId ?? null,
+          user_id: null,
+          token_present: !!token,
+          resolved: false,
+        }),
+      );
       return res.status(401).json({
         success: false,
         error: 'Invalid or expired token',
       });
     }
+
+    console.log(
+      JSON.stringify({
+        event: "auth_me_identity_resolved",
+        endpoint: "/api/auth/me",
+        request_id: requestId ?? null,
+        user_id: user.id,
+        token_present: !!token,
+        resolved: true,
+      }),
+    );
 
     const userName = user.user_metadata?.name || user.email?.split('@')[0] || 'User';
 

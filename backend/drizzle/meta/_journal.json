@@ -36,6 +36,20 @@
       "when": 1775529600000,
       "tag": "0004_consume_free_call_request",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1766534400000,
+      "tag": "0005_calls_user_joined_at",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1777345200000,
+      "tag": "0006_repair_consume_free_call_request",
+      "breakpoints": true
     }
   ]
 }

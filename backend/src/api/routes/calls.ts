@@ -6,7 +6,7 @@ import {
   TranscriptService,
 } from "../../database/services/call-service";
 import { CreateCallRequest, Call } from "../../types";
-import { initiateCall } from "../../services/telephony";
+import { initiateCall, connectUserToOngoingConference } from "../../services/telephony";
 import {
   validatePhoneNumber,
   validateCallPurpose,
@@ -19,8 +19,113 @@ import {
   authenticateCallApiToken,
 } from "../../utils/auth-middleware";
 import { config } from "../../config";
+import { io } from "../../server";
 
 const router = Router();
+
+function splitInstructionLines(input: string): string[] {
+  return input
+    .split(/\r?\n|[.;]\s+/)
+    .map((part) => part.trim())
+    .filter(Boolean);
+}
+
+function buildTalkingPoints(
+  talkingPoints: string[] | undefined,
+  additionalInstructions: string,
+): string[] {
+  if (Array.isArray(talkingPoints)) {
+    const clean = talkingPoints
+      .map((point) => (typeof point === "string" ? point.trim() : ""))
+      .filter(Boolean);
+    if (clean.length > 0) {
+      return clean;
+    }
+  }
+  return splitInstructionLines(additionalInstructions);
+}
+
+function buildStructuredAdditionalInstructions(params: {
+  purpose: string;
+  agentPrompt?: string;
+  additionalInstructions?: string;
+  openingLine?: string;
+  talkingPoints?: string[];
+  callBrief?: {
+    objective?: string;
+    must_ask?: string[];
+    preferences?: string[];
+    constraints?: string[];
+  };
+}): string {
+  const agentPrompt = (params.agentPrompt || "").trim();
+  const additionalInstructions = (params.additionalInstructions || "").trim();
+  const fallbackAdditionalInstructions = additionalInstructions || params.purpose;
+  const openingLine = (params.openingLine || "").trim();
+  const talkingPoints = buildTalkingPoints(
+    params.talkingPoints,
+    fallbackAdditionalInstructions,
+  );
+
+  const cleanList = (items?: string[]): string[] =>
+    (items || [])
+      .map((item) => (typeof item === "string" ? item.trim() : ""))
+      .filter(Boolean);
+
+  const lines: string[] = [];
+  lines.push("[[PROMPT_CONTEXT_V1]]");
+
+  if (agentPrompt) {
+    lines.push(`[[AGENT_PROMPT]]\n${agentPrompt}\n[[/AGENT_PROMPT]]`);
+  }
+
+  if (openingLine) {
+    lines.push(`[[OPENING_LINE]]\n${openingLine}\n[[/OPENING_LINE]]`);
+  }
+
+  if (talkingPoints.length > 0) {
+    lines.push(
+      `[[TALKING_POINTS]]\n${talkingPoints
+        .map((point, idx) => `${idx + 1}. ${point}`)
+        .join("\n")}\n[[/TALKING_POINTS]]`,
+    );
+  }
+
+  lines.push(`Context: ${fallbackAdditionalInstructions}`);
+
+  const objective = (params.callBrief?.objective || "").trim();
+  const mustAsk = cleanList(params.callBrief?.must_ask);
+  const preferences = cleanList(params.callBrief?.preferences);
+  const constraints = cleanList(params.callBrief?.constraints);
+
+  if (objective || mustAsk.length || preferences.length || constraints.length) {
+    lines.push("[[CALL_BRIEF]]");
+    lines.push("Call brief:");
+    if (objective) {
+      lines.push(`Objective: ${objective}`);
+    }
+    if (mustAsk.length > 0) {
+      lines.push(`Must ask:\n${mustAsk.map((item) => `- ${item}`).join("\n")}`);
+    }
+    if (preferences.length > 0) {
+      lines.push(
+        `Preferences:\n${preferences.map((item) => `- ${item}`).join("\n")}`,
+      );
+    }
+    if (constraints.length > 0) {
+      lines.push(
+        `Constraints:\n${constraints.map((item) => `- ${item}`).join("\n")}`,
+      );
+    }
+    lines.push("[[/CALL_BRIEF]]");
+  }
+
+  lines.push(
+    "[[GUARDRAILS]]\n- Use first-person singular (I), never we.\n- Do not proactively provide due date/service date unless asked or required.\n[[/GUARDRAILS]]",
+  );
+
+  return lines.join("\n\n");
+}
 
 // POST /api/calls - Create and initiate a new call (normal call: phone_number + purpose)
 router.post(
@@ -31,12 +136,17 @@ router.post(
   callCreationLimiter,
   async (req: Request, res: Response) => {
     try {
+      const requestId = (req as Request & { requestId?: string }).requestId;
       const {
         phone_number,
         purpose,
+        agent_prompt,
         name,
         voice_preference,
         additional_instructions,
+        opening_line,
+        talking_points,
+        call_brief,
       }: CreateCallRequest = req.body;
 
       // Validation
@@ -85,6 +195,7 @@ router.post(
             JSON.stringify({
               event: "free_call_quota_check",
               endpoint: "/api/calls",
+              request_id: requestId ?? null,
               user_id: userId,
               quota_allowed: quotaResult.allowed,
               remaining: quotaResult.remaining,
@@ -92,6 +203,18 @@ router.post(
           );
 
           if (!quotaResult.allowed) {
+            const quotaSnapshot =
+              await CallService.getFreeCallQuotaSnapshot(userId);
+            console.warn(
+              JSON.stringify({
+                event: "free_call_quota_denied",
+                endpoint: "/api/calls",
+                request_id: requestId ?? null,
+                user_id: userId,
+                free_call_limit: quotaSnapshot?.limit ?? null,
+                free_call_used: quotaSnapshot?.used ?? null,
+              }),
+            );
             return res.status(403).json({
               error: "Free trial exhausted",
               code: "FREE_CALL_LIMIT_REACHED",
@@ -103,6 +226,7 @@ router.post(
             JSON.stringify({
               event: "free_call_quota_check_failed",
               endpoint: "/api/calls",
+              request_id: requestId ?? null,
               user_id: userId,
               message: error instanceof Error ? error.message : "Unknown error",
             }),
@@ -127,9 +251,17 @@ router.post(
         status: "queued",
         created_at: new Date(),
         voice_preference: voice_preference || "professional_female",
-        additional_instructions: additional_instructions
-          ? sanitizeInput(additional_instructions.trim(), 1000)
-          : undefined,
+        additional_instructions: sanitizeInput(
+          buildStructuredAdditionalInstructions({
+            purpose: purpose.trim(),
+            agentPrompt: agent_prompt,
+            additionalInstructions: additional_instructions,
+            openingLine: opening_line,
+            talkingPoints: talking_points,
+            callBrief: call_brief,
+          }),
+          4000,
+        ),
       };
 
       console.log(`✅ Call created: ${call.id}, user_id: ${call.user_id}`);
@@ -158,6 +290,107 @@ router.post(
       res.status(500).json({
         success: false,
         error: "Failed to create call",
+        message: error instanceof Error ? error.message : "Unknown error",
+      });
+    }
+  },
+);
+
+/**
+ * POST /api/calls/:id/join
+ *
+ * End-to-end contract (match Holdless / frontend):
+ * - "Join call" dials the **end user** at the number they keep in the app (e.g. Profile → Phone),
+ *   not the business / CSR number stored on this call as `phone_number` (`to_number` in DB).
+ * - The browser sends `{ "to_phone": "<E.164>" }`. Only that value (after validation + normalization
+ *   here) is used for the Twilio **outbound leg to the user**. The server does **not** substitute
+ *   the business line from the row for this leg.
+ * - Auth: same as other call routes (`Authorization: Bearer <JWT>`, plus `CALL_API_TOKEN` if configured).
+ * - The server still checks the caller may access this `call_id` (ownership via `getCall`).
+ */
+router.post(
+  "/:id/join",
+  authenticateCallApiToken,
+  authenticateUser,
+  requireAuth,
+  async (req: Request, res: Response) => {
+    try {
+      const id = typeof req.params.id === "string" ? req.params.id : undefined;
+      if (!id) {
+        return res.status(400).json({ success: false, error: "Invalid call id" });
+      }
+      const userId = req.user?.id;
+      if (!userId && !config.auth.allowNoAuth) {
+        return res.status(401).json({
+          success: false,
+          error: "Authentication required",
+        });
+      }
+
+      const { to_phone } = req.body as { to_phone?: string };
+      if (!to_phone || typeof to_phone !== "string" || !to_phone.trim()) {
+        return res.status(400).json({
+          success: false,
+          error: "Missing required field: to_phone (E.164, the number to dial to reach you)",
+        });
+      }
+      const phoneCheck = validatePhoneNumber(to_phone.trim());
+      if (!phoneCheck.valid) {
+        return res.status(400).json({
+          success: false,
+          error: phoneCheck.message || "Invalid phone number",
+        });
+      }
+      const cleaned = to_phone.trim().replace(/[\s()-]/g, "");
+      const toE164 = cleaned.startsWith("+") ? cleaned : `+${cleaned}`;
+
+      const call = await CallService.getCall(id, userId);
+      if (!call) {
+        return res.status(404).json({ success: false, error: "Call not found" });
+      }
+      if (call.user_joined_at) {
+        return res.status(409).json({
+          success: false,
+          error: "You are already in this call (join was already used)",
+        });
+      }
+      if (call.status !== "in_progress") {
+        return res.status(400).json({
+          success: false,
+          error: "Call must be in progress to join. Wait until the line is active.",
+        });
+      }
+      if (!call.call_sid) {
+        return res.status(400).json({
+          success: false,
+          error: "This call is not connected to the phone network yet",
+        });
+      }
+
+      await connectUserToOngoingConference(call, toE164);
+
+      const joinedAt = new Date();
+      const updated = await CallService.updateCall(call.id, {
+        user_joined_at: joinedAt,
+      });
+
+      const payload = {
+        call_id: call.id,
+        joined_at: joinedAt.toISOString(),
+      };
+      io.to(`call:${call.id}`).emit("human_joined", payload);
+
+      res.json({
+        success: true,
+        call: updated ?? { ...call, user_joined_at: joinedAt },
+        message: "You are being called into the same conference. The AI session on the business line is ending.",
+        user_leg: "outbound_queued",
+      });
+    } catch (error) {
+      console.error("Error joining call:", error);
+      res.status(500).json({
+        success: false,
+        error: "Failed to join call",
         message: error instanceof Error ? error.message : "Unknown error",
       });
     }

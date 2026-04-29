@@ -172,14 +172,9 @@ export class RealtimeAPIConnection {
             process.env.OPENAI_PREFIX_PADDING_MS || "50",
             10
           ),
-          // Silence duration: How long to wait after speech ends before turn completion (ms)
-          // Lower = faster turn-taking, higher = waits for longer pauses (gives user more time)
-          // 2000ms = 2 seconds - gives user comfortable time to pause and continue speaking
-          // This prevents AI from interrupting user's natural pauses
-          silence_duration_ms: parseInt(
-            process.env.OPENAI_SILENCE_DURATION_MS || "2000",
-            10
-          ),
+          // Silence duration: how long to wait after speech ends before turn completion (ms).
+          // Uses config clamp (max 250ms) to prevent dead-air delays.
+          silence_duration_ms: config.openai.silenceDurationMs,
         },
         temperature: this.realtimeConfig.temperature || 1.0,
         max_response_output_tokens:

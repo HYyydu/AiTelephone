@@ -4,6 +4,7 @@ import { CallService } from "../../database/services/call-service";
 import { io } from "../../server";
 import { CallStatus, Call } from "../../types";
 import { getPublicBaseUrl } from "../../utils/public-url";
+import { isValidConferenceRoomName } from "../../services/telephony";
 
 const router = Router();
 
@@ -414,6 +415,42 @@ router.post("/twilio/voice", (req: Request, res: Response) => {
     res.send(fallbackTwiml);
   }
 });
+
+// GET/POST /api/webhooks/twilio/conference-join — join a Twilio conference (used when pulling the user in; Twilio fetches the URL)
+function conferenceJoinTwiMLHandler(req: Request, res: Response) {
+  try {
+    const roomRaw =
+      typeof req.query.room === "string" ? req.query.room.trim() : "";
+    if (!isValidConferenceRoomName(roomRaw)) {
+      console.error("❌ conference-join: invalid or missing room query");
+      const errTwiml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Hangup/>
+</Response>`;
+      res.type("text/xml");
+      return res.send(errTwiml);
+    }
+    const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Dial>
+    <Conference beep="false" endConferenceOnExit="false" startConferenceOnEnter="true">${roomRaw}</Conference>
+  </Dial>
+</Response>`;
+    res.type("text/xml");
+    return res.send(twiml);
+  } catch (e) {
+    console.error("❌ conference-join error:", e);
+    const errTwiml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Hangup/>
+</Response>`;
+    res.type("text/xml");
+    return res.send(errTwiml);
+  }
+}
+
+router.get("/twilio/conference-join", conferenceJoinTwiMLHandler);
+router.post("/twilio/conference-join", conferenceJoinTwiMLHandler);
 
 // POST /api/webhooks/twilio/dtmf - Handle DTMF tone sending via TwiML
 // This endpoint sends DTMF digits and then reconnects to the media stream

@@ -4,6 +4,7 @@ import cors from "cors";
 import { createServer } from "http";
 import { Server as SocketIOServer } from "socket.io";
 import { WebSocketServer } from "ws";
+import { randomUUID } from "crypto";
 import { config, validateConfig } from "./config";
 import callsRouter from "./api/routes/calls";
 import webhooksRouter from "./api/routes/webhooks";
@@ -249,8 +250,12 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 // Log every incoming request (so you can see when calls hit the backend)
-app.use((req: Request, _res: Response, next: Function) => {
-  console.log(`📥 ${req.method} ${req.path}`);
+app.use((req: Request, res: Response, next: Function) => {
+  const incomingRequestId = req.header("x-request-id")?.trim();
+  const requestId = incomingRequestId || randomUUID();
+  (req as Request & { requestId?: string }).requestId = requestId;
+  res.setHeader("x-request-id", requestId);
+  console.log(`📥 [${requestId}] ${req.method} ${req.path}`);
   next();
 });
 

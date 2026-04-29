@@ -54,6 +54,8 @@ export const calls = pgTable("calls", {
   created_at: timestamp("created_at").defaultNow(),
   started_at: timestamp("started_at"),
   ended_at: timestamp("ended_at"),
+  /** When the user (account owner) was added to a Twilio conference with the business line (AI leg ended). */
+  user_joined_at: timestamp("user_joined_at"),
 });
 
 // Transcripts table
