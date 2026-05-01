@@ -508,8 +508,7 @@ export class GPT4oRealtimeHandler {
       extractedName && !invalidNamePatterns.test(extractedName)
         ? extractedName
         : null;
-    const userName =
-      (this.call.name && this.call.name.trim()) || parsedName || "Holdless";
+    const userName = (this.call.name && this.call.name.trim()) || parsedName || "";
 
     // Extract order number (look for patterns like "Order Number: 12345", "order number 12345", "order #12345")
     const orderNumberMatch = (purpose + " " + additionalContextPlain).match(

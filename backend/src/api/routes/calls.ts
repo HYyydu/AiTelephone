@@ -157,6 +157,16 @@ router.post(
         });
       }
 
+      const trimmedName = typeof name === "string" ? name.trim() : "";
+      if (!trimmedName) {
+        return res.status(400).json({
+          success: false,
+          code: "missing_caller_name",
+          message: "Who am I calling for?",
+          error: "Missing required field: name",
+        });
+      }
+
       // Validate phone number
       const phoneValidation = validatePhoneNumber(phone_number);
       if (!phoneValidation.valid) {
@@ -247,7 +257,7 @@ router.post(
         user_id: userId,
         phone_number: sanitizeInput(phone_number, 20),
         purpose: sanitizeInput(purpose.trim(), 2000),
-        name: name?.trim() ? sanitizeInput(name.trim(), 100) : undefined,
+        name: sanitizeInput(trimmedName, 100),
         status: "queued",
         created_at: new Date(),
         voice_preference: voice_preference || "professional_female",
