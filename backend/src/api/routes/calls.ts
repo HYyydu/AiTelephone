@@ -6,7 +6,11 @@ import {
   TranscriptService,
 } from "../../database/services/call-service";
 import { CreateCallRequest, Call } from "../../types";
-import { initiateCall, connectUserToOngoingConference } from "../../services/telephony";
+import {
+  initiateCall,
+  connectUserToOngoingConference,
+  endCall,
+} from "../../services/telephony";
 import {
   validatePhoneNumber,
   validateCallPurpose,
@@ -22,6 +26,65 @@ import { config } from "../../config";
 import { io } from "../../server";
 
 const router = Router();
+
+/** Merged briefing (PROMPT_CONTEXT_V1 + agent_prompt + talking_points + …) stored in `additional_instructions`. Must not truncate below ~2k + ~6k + lists + markers. */
+const MAX_STRUCTURED_ADDITIONAL_INSTRUCTIONS_CHARS = 16_000;
+
+/** DB may use `pending` (schema default); types use queued/calling/in_progress for live calls. */
+function isCallOngoingStatus(status: string): boolean {
+  return (
+    status === "calling" ||
+    status === "in_progress" ||
+    status === "queued" ||
+    status === "pending"
+  );
+}
+
+/**
+ * Hang up the Twilio leg if possible, then mark the call completed so UI/API never stay "ongoing"
+ * when the session is already dead (missed webhooks, tunnel issues, etc.).
+ */
+async function forceEndOngoingCall(call: Call): Promise<{
+  updated: Call | undefined;
+  alreadyTerminal: boolean;
+}> {
+  if (!isCallOngoingStatus(call.status)) {
+    return { updated: undefined, alreadyTerminal: true };
+  }
+
+  if (call.call_sid) {
+    try {
+      await endCall(call.call_sid);
+    } catch (e) {
+      console.warn(
+        `⚠️ force end: Twilio hangup failed for ${call.id} (call may already be completed):`,
+        e,
+      );
+    }
+  }
+
+  const endedAt = new Date();
+  const updated = await CallService.updateCall(call.id, {
+    status: "completed",
+    ended_at: endedAt,
+    outcome: call.outcome ?? "force_ended",
+  });
+
+  io.to(`call:${call.id}`).emit("call_status", {
+    call_id: call.id,
+    status: "completed",
+    duration: updated?.duration_seconds,
+  });
+  io.to(`call:${call.id}`).emit("call_ended", {
+    call_id: call.id,
+    outcome: updated?.outcome,
+    duration: updated?.duration_seconds ?? 0,
+    ended_at: endedAt.toISOString(),
+    end_reason: "force_ended",
+  });
+
+  return { updated, alreadyTerminal: false };
+}
 
 function splitInstructionLines(input: string): string[] {
   return input
@@ -270,7 +333,7 @@ router.post(
             talkingPoints: talking_points,
             callBrief: call_brief,
           }),
-          4000,
+          MAX_STRUCTURED_ADDITIONAL_INSTRUCTIONS_CHARS,
         ),
       };
 
@@ -430,6 +493,81 @@ router.get("/", authenticateUser, async (req: Request, res: Response) => {
     });
   }
 });
+
+// POST /api/calls/reconcile-ongoing — end every stuck ongoing call for this user (Twilio + DB)
+router.post(
+  "/reconcile-ongoing",
+  authenticateUser,
+  requireAuth,
+  async (req: Request, res: Response) => {
+    try {
+      const userId = req.user?.id;
+      if (!userId) {
+        return res.status(401).json({ success: false, error: "Unauthorized" });
+      }
+      const all = await CallService.getAllCalls(userId);
+      const stuck = all.filter((c) => isCallOngoingStatus(c.status));
+      const ended: string[] = [];
+      for (const c of stuck) {
+        const { updated } = await forceEndOngoingCall(c);
+        if (updated) ended.push(updated.id);
+      }
+      res.json({
+        success: true,
+        ended_call_ids: ended,
+        count: ended.length,
+      });
+    } catch (error) {
+      console.error("Error reconciling ongoing calls:", error);
+      res.status(500).json({
+        success: false,
+        error: "Failed to reconcile ongoing calls",
+      });
+    }
+  },
+);
+
+// POST /api/calls/:id/end — force-end one ongoing call (same user only)
+router.post(
+  "/:id/end",
+  authenticateUser,
+  requireAuth,
+  async (req: Request, res: Response) => {
+    try {
+      const id = typeof req.params.id === "string" ? req.params.id : undefined;
+      if (!id) {
+        return res.status(400).json({ success: false, error: "Invalid call id" });
+      }
+      const userId = req.user?.id;
+      if (!userId) {
+        return res.status(401).json({ success: false, error: "Unauthorized" });
+      }
+      const call = await CallService.getCall(id, userId);
+      if (!call) {
+        return res.status(404).json({ success: false, error: "Call not found" });
+      }
+      const { updated, alreadyTerminal } = await forceEndOngoingCall(call);
+      if (alreadyTerminal) {
+        return res.json({
+          success: true,
+          message: "Call was already ended",
+          call,
+        });
+      }
+      res.json({
+        success: true,
+        message: "Call ended",
+        call: updated,
+      });
+    } catch (error) {
+      console.error("Error force-ending call:", error);
+      res.status(500).json({
+        success: false,
+        error: "Failed to end call",
+      });
+    }
+  },
+);
 
 // GET /api/calls/:id - Get a specific call (only if it belongs to the authenticated user)
 router.get("/:id", authenticateUser, async (req: Request, res: Response) => {

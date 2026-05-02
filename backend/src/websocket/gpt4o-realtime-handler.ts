@@ -5942,6 +5942,42 @@ CALL FLOW:
     }
   }
 
+  /**
+   * After we end the Twilio leg from the server, persist terminal status immediately.
+   * Relying only on the status webhook can leave calls stuck "in progress" if the webhook
+   * is delayed, dropped, or PUBLIC_URL/tunnel mismatches — UI then shows an ongoing call.
+   */
+  private async persistCompletedCallAfterServerHangup(options: {
+    outcome?: string;
+    end_reason?: "token_budget";
+  } = {}): Promise<void> {
+    if (!this.call?.id) return;
+    const endedAt = new Date();
+    await CallService.updateCall(this.call.id, {
+      status: "completed",
+      ended_at: endedAt,
+      input_tokens: this.totalInputTokens,
+      output_tokens: this.totalOutputTokens,
+      ...(options.outcome !== undefined ? { outcome: options.outcome } : {}),
+    });
+    const endReason =
+      options.end_reason ??
+      (options.outcome === "token_budget_exceeded"
+        ? ("token_budget" as const)
+        : undefined);
+    io.to(`call:${this.call.id}`).emit("call_status", {
+      call_id: this.call.id,
+      status: "completed",
+    });
+    io.to(`call:${this.call.id}`).emit("call_ended", {
+      call_id: this.call.id,
+      outcome: options.outcome,
+      duration: 0,
+      ended_at: endedAt.toISOString(),
+      ...(endReason ? { end_reason: endReason } : {}),
+    });
+  }
+
   private async hangUpDueToTokenBudget(
     usedTokens: number,
     limitTokens: number,
@@ -5971,13 +6007,11 @@ CALL FLOW:
         limit_tokens: limitTokens,
       });
 
-      await CallService.updateCall(this.call.id, {
-        input_tokens: this.totalInputTokens,
-        output_tokens: this.totalOutputTokens,
-        outcome: "token_budget_exceeded",
-      });
-
       await endCall(this.callSid);
+      await this.persistCompletedCallAfterServerHangup({
+        outcome: "token_budget_exceeded",
+        end_reason: "token_budget",
+      });
       console.log(
         `📴 Token budget: Twilio call ended (used ${usedTokens} / ${limitTokens} tokens)`,
       );
@@ -6005,6 +6039,7 @@ CALL FLOW:
 
     try {
       await endCall(this.callSid);
+      await this.persistCompletedCallAfterServerHangup();
       console.log(
         "📴 Idle hang-up: Twilio call ended (user silent after presence check)",
       );
