@@ -337,7 +337,16 @@ io.on("connection", (socket) => {
             ...(call.outcome === "token_budget_exceeded"
               ? { end_reason: "token_budget" as const }
               : {}),
+            ...(call.recording_url
+              ? { recording_url: call.recording_url }
+              : {}),
           });
+          if (call.recording_url) {
+            socket.emit("recording_ready", {
+              call_id: call.id,
+              recording_url: call.recording_url,
+            });
+          }
           console.log(
             `📴 Call already ended: sent call_ended to client ${socket.id} for call ${callId}`,
           );

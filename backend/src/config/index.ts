@@ -24,7 +24,7 @@ export const config = {
     realtimeApiUrl:
       process.env.OPENAI_REALTIME_API_URL || "wss://api.openai.com/v1/realtime",
     realtimeModel:
-      process.env.OPENAI_REALTIME_MODEL || "gpt-4o-realtime-preview-2024-12-17",
+      process.env.OPENAI_REALTIME_MODEL || "gpt-realtime",
     /** OpenAI Realtime session voice (e.g. ash, coral). Empty = use per-call voice_preference mapping in handler. */
     realtimeVoice: (process.env.OPENAI_REALTIME_VOICE || "").trim(),
     // Anti-repetition settings (0.0 to 2.0)
@@ -142,7 +142,7 @@ export const config = {
   // Call configuration
   call: {
     maxDurationMinutes: 15,
-    recordCalls: true,
+    recordCalls: process.env.RECORD_CALLS !== "false",
     /** Max time in ON_HOLD before auto-resuming audio to GPT (0 = no timeout). */
     holdTimeoutMs: parseInt(process.env.CALL_HOLD_TIMEOUT_MS || "600000", 10),
     /**

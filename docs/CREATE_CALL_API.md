@@ -291,7 +291,14 @@ socket.on("call_ended", (data) => {
   // Strong signal: call has ended (e.g. user hung up). Update UI and optionally leave room.
   console.log("Call ended:", data.duration, data.outcome, data.ended_at);
   // data.ended_at is ISO timestamp when the call ended (if present)
+  // data.recording_url may be present when Twilio recording is ready
   socket.emit("leave_call", data.call_id);
+});
+
+socket.on("recording_ready", (data) => {
+  // Twilio finished processing the call recording
+  // data: { call_id, recording_url }
+  // Play via GET /api/calls/:id/recording (authenticated proxy)
 });
 ```
 
@@ -340,6 +347,40 @@ const result = {
 
 // result = { callId, status, callReason, message }
 ```
+
+---
+
+## Join call live + let AI take over
+
+While a call is **`in_progress`**, the account owner can join the same Twilio conference as the CSR, then hand the line back to Holdless.
+
+### Join call (user speaks with CSR)
+
+**`POST /api/calls/:id/join`**
+
+- Auth: `Authorization: Bearer <token>` (same as create call)
+- Body: `{ "to_phone": "+1..." }` — the user's profile phone (E.164), **not** the business number on the call
+- Effect: CSR leg moves into a conference; user is dialed in; AI media stream on the business leg stops
+- Socket: `human_joined` `{ call_id, joined_at }`
+- Conference audio is transcribed via Twilio when possible; segments are saved as `speaker: "human"` and emitted as `transcript`
+
+### Let AI take over (Holdless resumes)
+
+**`POST /api/calls/:id/ai-takeover`**
+
+- Requires a prior successful **join** (`user_joined_at` set)
+- Effect: user's phone leg ends; CSR leg reconnects to the Media Stream; Holdless resumes with transcript context (before + during live join)
+- Socket: `ai_takeover` `{ call_id, taken_over_at }`
+- Holdless speaks first with a short continuation (no full re-introduction)
+
+### Suggested UI flow
+
+1. User taps **Join call** → `POST .../join` with profile phone
+2. User talks with the representative
+3. User taps **Let AI take over** → `POST .../ai-takeover`
+4. Keep Socket.io `join_call` active to receive `transcript`, `ai_takeover`, and resumed AI segments
+
+Run migration `backend/drizzle/0007_calls_ai_takeover.sql` before using takeover in production.
 
 ---
 

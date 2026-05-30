@@ -4,9 +4,23 @@ import { CallService } from "../../database/services/call-service";
 import { io } from "../../server";
 import { CallStatus, Call } from "../../types";
 import { getPublicBaseUrl } from "../../utils/public-url";
-import { isValidConferenceRoomName } from "../../services/telephony";
+import {
+  callIdFromConferenceRoom,
+  isValidConferenceRoomName,
+} from "../../services/telephony";
+import { TranscriptService } from "../../database/services/call-service";
+import { v4 as uuidv4 } from "uuid";
+import { syncCallRecording } from "../../services/call-recording";
 
 const router = Router();
+
+function emitRecordingReady(callId: string, recordingUrl: string): void {
+  io.to(`call:${callId}`).emit("recording_ready", {
+    call_id: callId,
+    recording_url: recordingUrl,
+  });
+  console.log(`🎙️ Recording ready | call_id: ${callId}`);
+}
 
 // GET /api/webhooks/test - Test endpoint to verify webhook is reachable
 router.get("/test", (req: Request, res: Response) => {
@@ -151,11 +165,20 @@ router.get("/twilio/voice", (req: Request, res: Response) => {
 // POST /api/webhooks/twilio/status - Handle call status updates from Twilio
 router.post("/twilio/status", async (req: Request, res: Response) => {
   try {
-    const { CallSid, CallStatus, CallDuration, RecordingUrl, To, From } =
-      req.body;
+    const {
+      CallSid,
+      CallStatus,
+      CallDuration,
+      RecordingUrl,
+      RecordingStatus,
+      To,
+      From,
+    } = req.body;
 
+    const recordingUrlFromWebhook =
+      typeof RecordingUrl === "string" ? RecordingUrl.trim() : "";
     console.log(
-      `📞 Twilio status webhook - CallSid: ${CallSid}, Status: ${CallStatus}, To: ${To ?? "?"}, From: ${From ?? "?"}`
+      `📞 Twilio status webhook - CallSid: ${CallSid}, Status: ${CallStatus ?? "(recording callback)"}, To: ${To ?? "?"}, From: ${From ?? "?"}${recordingUrlFromWebhook ? `, RecordingUrl: yes` : ""}`,
     );
 
     // Find the call by Twilio SID (optimized query)
@@ -228,7 +251,11 @@ router.post("/twilio/status", async (req: Request, res: Response) => {
       updates.duration_seconds = parseInt(CallDuration, 10);
     }
 
-    if (RecordingUrl) {
+    const recordingStatus = String(RecordingStatus ?? "").toLowerCase();
+    if (
+      RecordingUrl &&
+      (!recordingStatus || recordingStatus === "completed")
+    ) {
       updates.recording_url = RecordingUrl;
     }
 
@@ -238,6 +265,10 @@ router.post("/twilio/status", async (req: Request, res: Response) => {
 
     await CallService.updateCall(call.id, updates);
 
+    if (updates.recording_url) {
+      emitRecordingReady(call.id, updates.recording_url);
+    }
+
     // Emit WebSocket event so frontend gets live status
     io.to(`call:${call.id}`).emit("call_status", {
       call_id: call.id,
@@ -245,21 +276,44 @@ router.post("/twilio/status", async (req: Request, res: Response) => {
       duration: updates.duration_seconds,
     });
 
+    // Recording-only callbacks (no CallStatus) should not re-emit call_ended.
+    const isRecordingOnlyCallback =
+      Boolean(recordingUrlFromWebhook) &&
+      (CallStatus == null || String(CallStatus).trim() === "");
+
     // Strong signal: emit call_ended when call is completed or failed (e.g. user hung up)
-    if (status === "completed" || status === "failed") {
+    if (
+      (status === "completed" || status === "failed") &&
+      !isRecordingOnlyCallback
+    ) {
       const endedAt = updates.ended_at ?? new Date();
       const fresh = await CallService.getCall(call.id);
       const outcome = fresh?.outcome ?? call.outcome;
       const endReason =
         outcome === "token_budget_exceeded" ? "token_budget" : undefined;
+      let recordingUrl =
+        updates.recording_url ?? fresh?.recording_url ?? call.recording_url;
+      if (!recordingUrl && call.call_sid) {
+        const synced = await syncCallRecording({
+          ...call,
+          ...updates,
+          status,
+        });
+        if (synced) recordingUrl = synced;
+      }
+
       const payload = {
         call_id: call.id,
         outcome,
         duration: updates.duration_seconds ?? 0,
         ended_at: endedAt instanceof Date ? endedAt.toISOString() : endedAt,
         ...(endReason ? { end_reason: endReason } : {}),
+        ...(recordingUrl ? { recording_url: recordingUrl } : {}),
       };
       io.to(`call:${call.id}`).emit("call_ended", payload);
+      if (recordingUrl && !updates.recording_url) {
+        emitRecordingReady(call.id, recordingUrl);
+      }
       console.log(
         `📴 Call ended signal sent to frontend | call_id: ${call.id} | status: ${status} | duration: ${payload.duration}s`
       );
@@ -430,8 +484,18 @@ function conferenceJoinTwiMLHandler(req: Request, res: Response) {
       res.type("text/xml");
       return res.send(errTwiml);
     }
+    const callId = callIdFromConferenceRoom(roomRaw);
+    const baseUrl = getPublicBaseUrl();
+    const transcriptionStart =
+      callId && baseUrl
+        ? `
+  <Start>
+    <Transcription statusCallbackUrl="${baseUrl}/api/webhooks/twilio/transcription?callId=${encodeURIComponent(callId)}" track="both_tracks" />
+  </Start>`
+        : "";
+
     const twiml = `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
+<Response>${transcriptionStart}
   <Dial>
     <Conference beep="false" endConferenceOnExit="false" startConferenceOnEnter="true">${roomRaw}</Conference>
   </Dial>
@@ -451,6 +515,73 @@ function conferenceJoinTwiMLHandler(req: Request, res: Response) {
 
 router.get("/twilio/conference-join", conferenceJoinTwiMLHandler);
 router.post("/twilio/conference-join", conferenceJoinTwiMLHandler);
+
+function parseTranscriptionPayload(body: Record<string, unknown>): string | null {
+  const direct =
+    typeof body.TranscriptionText === "string"
+      ? body.TranscriptionText
+      : typeof body.transcription_text === "string"
+        ? body.transcription_text
+        : null;
+  if (direct?.trim()) return direct.trim();
+
+  const dataRaw = body.TranscriptionData ?? body.transcription_data;
+  if (typeof dataRaw === "string" && dataRaw.trim()) {
+    try {
+      const parsed = JSON.parse(dataRaw) as { transcript?: string; text?: string };
+      const text = parsed.transcript || parsed.text;
+      if (typeof text === "string" && text.trim()) return text.trim();
+    } catch {
+      /* ignore */
+    }
+  }
+  return null;
+}
+
+// POST /api/webhooks/twilio/transcription — Twilio real-time transcription during user join conference
+router.post("/twilio/transcription", async (req: Request, res: Response) => {
+  try {
+    const callId =
+      typeof req.query.callId === "string" ? req.query.callId.trim() : "";
+    if (!callId) {
+      return res.status(400).send("missing callId");
+    }
+
+    const event =
+      typeof req.body?.TranscriptionEvent === "string"
+        ? req.body.TranscriptionEvent
+        : typeof req.body?.transcription_event === "string"
+          ? req.body.transcription_event
+          : "";
+
+    if (event && event !== "transcription-content") {
+      return res.status(200).send("ok");
+    }
+
+    const text = parseTranscriptionPayload(
+      (req.body || {}) as Record<string, unknown>,
+    );
+    if (!text) {
+      return res.status(200).send("ok");
+    }
+
+    const transcript = {
+      id: uuidv4(),
+      call_id: callId,
+      speaker: "human" as const,
+      message: text,
+      timestamp: new Date(),
+    };
+    await TranscriptService.addTranscript(transcript);
+    io.to(`call:${callId}`).emit("transcript", transcript);
+    console.log(`📝 Conference transcript | call ${callId}: ${text.slice(0, 80)}…`);
+
+    res.status(200).send("ok");
+  } catch (e) {
+    console.error("❌ transcription webhook error:", e);
+    res.status(500).send("error");
+  }
+});
 
 // POST /api/webhooks/twilio/dtmf - Handle DTMF tone sending via TwiML
 // This endpoint sends DTMF digits and then reconnects to the media stream

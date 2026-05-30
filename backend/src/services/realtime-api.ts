@@ -26,11 +26,12 @@ export class RealtimeAPIConnection {
   private realtimeConfig: RealtimeConfig;
   private messageHandlers: Map<string, (data: any) => void> = new Map();
   private isConnected: boolean = false;
+  private sessionConfigured: boolean = false;
   private keepaliveInterval: NodeJS.Timeout | null = null;
 
   constructor(realtimeConfig: RealtimeConfig = {}) {
     this.realtimeConfig = {
-      model: realtimeConfig.model || "gpt-4o-realtime-preview-2024-12-17",
+      model: realtimeConfig.model || "gpt-realtime",
       voice: realtimeConfig.voice || "ash",
       temperature: realtimeConfig.temperature || 1.0,
       max_response_output_tokens:
@@ -59,7 +60,6 @@ export class RealtimeAPIConnection {
     return new Promise((resolve, reject) => {
       const headers: { [key: string]: string } = {
         Authorization: `Bearer ${config.openai.apiKey}`,
-        "OpenAI-Beta": "realtime=v1", // Required for Realtime API access
       };
 
       console.log(
@@ -111,6 +111,7 @@ export class RealtimeAPIConnection {
           `🔴 OpenAI Realtime API WebSocket closed: ${code} ${reason}`
         );
         this.isConnected = false;
+        this.sessionConfigured = false;
 
         // Clear keepalive interval
         if (this.keepaliveInterval) {
@@ -144,46 +145,69 @@ export class RealtimeAPIConnection {
       `   - VAD create_response (API auto-reply per turn): ${process.env.OPENAI_VAD_CREATE_RESPONSE === "true"}`,
     );
 
+    const vadCreateResponse =
+      process.env.OPENAI_VAD_CREATE_RESPONSE === "true";
+
     const sessionConfig = {
       type: "session.update",
       session: {
-        modalities: ["text", "audio"],
+        type: "realtime",
+        model: this.realtimeConfig.model,
         instructions: instructions || this.realtimeConfig.instructions || "",
-        voice: this.realtimeConfig.voice || "ash",
-        input_audio_format: "pcm16", // PCM 16-bit, 24kHz
-        output_audio_format: "pcm16",
-        input_audio_transcription: {
-          model: "whisper-1",
+        output_modalities: ["audio"],
+        audio: {
+          input: {
+            format: {
+              type: "audio/pcm",
+              rate: 24000,
+            },
+            transcription: {
+              model: "whisper-1",
+            },
+            turn_detection: {
+              type: "server_vad",
+              // When false (default), only our explicit response.create runs after transcription.
+              create_response: vadCreateResponse,
+              threshold: parseFloat(process.env.OPENAI_VAD_THRESHOLD || "0.05"),
+              prefix_padding_ms: parseInt(
+                process.env.OPENAI_PREFIX_PADDING_MS || "50",
+                10
+              ),
+              silence_duration_ms: config.openai.silenceDurationMs,
+            },
+          },
+          output: {
+            format: {
+              type: "audio/pcm",
+              rate: 24000,
+            },
+            voice: this.realtimeConfig.voice || "ash",
+          },
         },
-        turn_detection: {
-          type: "server_vad",
-          // When false (default), the API does not auto-emit response.create after each turn; only our
-          // explicit response.create (after transcription + debounce) runs. Prevents echo/noise from
-          // triggering unsolicited replies. Set OPENAI_VAD_CREATE_RESPONSE=true to restore API auto-replies.
-          create_response: process.env.OPENAI_VAD_CREATE_RESPONSE === "true",
-          // VAD threshold: Lower = more sensitive to speech (0.05-0.2 range)
-          // 0.05-0.08 = MAXIMUM sensitivity - detects even quiet speech immediately
-          // Default: 0.05 for maximum sensitivity to catch user speech as early as possible
-          threshold: parseFloat(process.env.OPENAI_VAD_THRESHOLD || "0.05"),
-          // Prefix padding: Audio to include before speech start (ms)
-          // Lower values = faster detection, higher = more context
-          // 50ms = MAXIMUM speed - detects speech as early as possible
-          prefix_padding_ms: parseInt(
-            process.env.OPENAI_PREFIX_PADDING_MS || "50",
-            10
-          ),
-          // Silence duration: how long to wait after speech ends before turn completion (ms).
-          // Uses config clamp (max 250ms) to prevent dead-air delays.
-          silence_duration_ms: config.openai.silenceDurationMs,
-        },
-        temperature: this.realtimeConfig.temperature || 1.0,
-        max_response_output_tokens:
-          this.realtimeConfig.max_response_output_tokens || 4096,
       },
     };
 
+    this.sessionConfigured = false;
     this.send(sessionConfig);
     console.log("✅ Session configuration sent");
+  }
+
+  private buildResponseOptions(
+    instructions?: string,
+  ): Record<string, unknown> {
+    // GA gpt-realtime: response.create accepts output_modalities + optional instructions only
+    // (temperature / max_output_tokens are not valid on response.*).
+    const response: Record<string, unknown> = {
+      output_modalities: ["audio"],
+    };
+    if (instructions) {
+      response.instructions = instructions;
+    }
+    return response;
+  }
+
+  isSessionConfigured(): boolean {
+    return this.sessionConfigured;
   }
 
   /**
@@ -256,9 +280,7 @@ export class RealtimeAPIConnection {
 
     this.send({
       type: "response.create",
-      response: {
-        modalities: ["audio", "text"],
-      },
+      response: this.buildResponseOptions(),
     });
 
     return true;
@@ -274,10 +296,7 @@ export class RealtimeAPIConnection {
 
     this.send({
       type: "response.create",
-      response: {
-        modalities: ["audio", "text"],
-        instructions,
-      },
+      response: this.buildResponseOptions(instructions),
     });
 
     return true;
@@ -310,10 +329,22 @@ export class RealtimeAPIConnection {
   private handleMessage(message: any) {
     const messageType = message.type || "unknown";
 
+    if (messageType === "session.updated") {
+      this.sessionConfigured = true;
+      console.log("✅ Realtime API session.updated — GA config applied");
+    } else if (
+      messageType === "error" &&
+      message.error?.param?.startsWith?.("session.")
+    ) {
+      this.sessionConfigured = false;
+    }
+
     // Log message types for debugging
     if (
       !messageType.includes("audio_transcript") &&
-      !messageType.includes("audio.delta")
+      !messageType.includes("output_audio_transcript") &&
+      !messageType.includes("audio.delta") &&
+      !messageType.includes("output_audio.delta")
     ) {
       console.log(`📨 Realtime API message: ${messageType}`);
     }

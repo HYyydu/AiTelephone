@@ -56,6 +56,10 @@ export const calls = pgTable("calls", {
   ended_at: timestamp("ended_at"),
   /** When the user (account owner) was added to a Twilio conference with the business line (AI leg ended). */
   user_joined_at: timestamp("user_joined_at"),
+  /** Twilio CallSid for the outbound leg dialed to the account owner during join. */
+  user_join_call_sid: varchar("user_join_call_sid", { length: 255 }),
+  /** When Holdless was handed back to the CSR leg after a live user join. */
+  ai_takeover_at: timestamp("ai_takeover_at"),
 });
 
 // Transcripts table

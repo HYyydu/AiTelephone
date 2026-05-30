@@ -51,6 +51,10 @@ export interface Call {
   ended_at?: Date;
   /** Set when the user (account owner) joined the same conference as the business line; AI media stream for that call ended. */
   user_joined_at?: Date;
+  /** Twilio CallSid for the account owner's conference leg (ended on AI takeover). */
+  user_join_call_sid?: string;
+  /** Set when Holdless resumes on the CSR leg after a live user join. */
+  ai_takeover_at?: Date;
   duration_seconds?: number;
   recording_url?: string;
   call_sid?: string;
@@ -118,6 +122,13 @@ export interface WebSocketEvents {
     ended_at?: string; // ISO timestamp when call ended (strong signal for frontend)
     /** Present when known (e.g. token_budget_exceeded). */
     end_reason?: string;
+    /** Twilio recording URL when available at hangup. */
+    recording_url?: string;
+  };
+  /** Fired when Twilio finishes processing the call recording. */
+  recording_ready: {
+    call_id: string;
+    recording_url: string;
   };
   call_hold_status: {
     call_id: string;
@@ -153,6 +164,11 @@ export interface WebSocketEvents {
   human_joined: {
     call_id: string;
     joined_at: string;
+  };
+  /** Holdless resumed on the CSR leg; user conference leg is being dropped. */
+  ai_takeover: {
+    call_id: string;
+    taken_over_at: string;
   };
 }
 

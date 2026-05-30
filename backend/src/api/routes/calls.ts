@@ -10,6 +10,8 @@ import {
   initiateCall,
   connectUserToOngoingConference,
   endCall,
+  reconnectBusinessLegToMediaStream,
+  endUserConferenceLeg,
 } from "../../services/telephony";
 import {
   validatePhoneNumber,
@@ -24,6 +26,10 @@ import {
 } from "../../utils/auth-middleware";
 import { config } from "../../config";
 import { io } from "../../server";
+import {
+  fetchRecordingStream,
+  syncCallRecording,
+} from "../../services/call-recording";
 
 const router = Router();
 
@@ -338,6 +344,9 @@ router.post(
       };
 
       console.log(`✅ Call created: ${call.id}, user_id: ${call.user_id}`);
+      console.log(
+        `📋 Call briefing: purpose=${call.purpose.length} chars, additional_instructions=${call.additional_instructions?.length ?? 0} chars, talking_points=${Array.isArray(talking_points) ? talking_points.length : 0}, name=${call.name ?? "(default)"}`,
+      );
 
       // Save to database
       await CallService.createCall(call);
@@ -440,11 +449,15 @@ router.post(
         });
       }
 
-      await connectUserToOngoingConference(call, toE164);
+      const { user_leg_call_sid } = await connectUserToOngoingConference(
+        call,
+        toE164,
+      );
 
       const joinedAt = new Date();
       const updated = await CallService.updateCall(call.id, {
         user_joined_at: joinedAt,
+        user_join_call_sid: user_leg_call_sid,
       });
 
       const payload = {
@@ -464,6 +477,97 @@ router.post(
       res.status(500).json({
         success: false,
         error: "Failed to join call",
+        message: error instanceof Error ? error.message : "Unknown error",
+      });
+    }
+  },
+);
+
+/**
+ * POST /api/calls/:id/ai-takeover
+ *
+ * "Let AI take over" after the account owner joined live: drop the user's phone leg,
+ * reconnect the CSR leg to the Media Stream, and resume Holdless with full transcript context.
+ */
+router.post(
+  "/:id/ai-takeover",
+  authenticateCallApiToken,
+  authenticateUser,
+  requireAuth,
+  async (req: Request, res: Response) => {
+    try {
+      const id = typeof req.params.id === "string" ? req.params.id : undefined;
+      if (!id) {
+        return res.status(400).json({ success: false, error: "Invalid call id" });
+      }
+      const userId = req.user?.id;
+      if (!userId && !config.auth.allowNoAuth) {
+        return res.status(401).json({
+          success: false,
+          error: "Authentication required",
+        });
+      }
+
+      const call = await CallService.getCall(id, userId);
+      if (!call) {
+        return res.status(404).json({ success: false, error: "Call not found" });
+      }
+      if (!call.user_joined_at) {
+        return res.status(400).json({
+          success: false,
+          error: "You must join the call live before handing back to the AI",
+        });
+      }
+      if (call.ai_takeover_at) {
+        return res.status(409).json({
+          success: false,
+          error: "AI has already taken over this call",
+        });
+      }
+      if (call.status !== "in_progress") {
+        return res.status(400).json({
+          success: false,
+          error: "Call must be in progress for AI takeover",
+        });
+      }
+      if (!call.call_sid) {
+        return res.status(400).json({
+          success: false,
+          error: "This call is not connected to the phone network yet",
+        });
+      }
+
+      const takenOverAt = new Date();
+      await CallService.updateCall(call.id, { ai_takeover_at: takenOverAt });
+
+      if (call.user_join_call_sid) {
+        await endUserConferenceLeg(call.user_join_call_sid);
+      }
+
+      await reconnectBusinessLegToMediaStream(call);
+
+      const updated = await CallService.updateCall(call.id, {
+        ai_takeover_at: takenOverAt,
+      });
+
+      const payload = {
+        call_id: call.id,
+        taken_over_at: takenOverAt.toISOString(),
+      };
+      io.to(`call:${call.id}`).emit("ai_takeover", payload);
+
+      res.json({
+        success: true,
+        call: updated ?? { ...call, ai_takeover_at: takenOverAt },
+        message:
+          "Holdless is rejoining the line with the representative. Your phone leg is ending.",
+        ai_leg: "media_stream_reconnecting",
+      });
+    } catch (error) {
+      console.error("Error during AI takeover:", error);
+      res.status(500).json({
+        success: false,
+        error: "Failed to hand call back to AI",
         message: error instanceof Error ? error.message : "Unknown error",
       });
     }
@@ -588,9 +692,21 @@ router.get("/:id", authenticateUser, async (req: Request, res: Response) => {
       });
     }
 
+    let recordingUrl = call.recording_url;
+    const isTerminal =
+      call.status === "completed" || call.status === "failed";
+    if (!recordingUrl && isTerminal && call.call_sid) {
+      recordingUrl = await syncCallRecording(call);
+    }
+
+    const callWithRecording = recordingUrl
+      ? { ...call, recording_url: recordingUrl }
+      : call;
+
     res.json({
       success: true,
-      call,
+      call: callWithRecording,
+      has_recording: Boolean(recordingUrl),
     });
   } catch (error) {
     console.error("Error fetching call:", error);
@@ -600,6 +716,69 @@ router.get("/:id", authenticateUser, async (req: Request, res: Response) => {
     });
   }
 });
+
+// GET /api/calls/:id/recording - Stream call recording audio (authenticated proxy to Twilio)
+router.get(
+  "/:id/recording",
+  authenticateUser,
+  async (req: Request, res: Response) => {
+    try {
+      const id = typeof req.params.id === "string" ? req.params.id : undefined;
+      if (!id) {
+        return res
+          .status(400)
+          .json({ success: false, error: "Invalid call id" });
+      }
+      const userId = req.user?.id;
+      const call = await CallService.getCall(id, userId);
+      if (!call) {
+        return res.status(404).json({
+          success: false,
+          error: "Call not found",
+        });
+      }
+
+      let recordingUrl = call.recording_url;
+      if (!recordingUrl) {
+        recordingUrl = await syncCallRecording(call);
+      }
+      if (!recordingUrl) {
+        console.log(
+          `🎙️ Recording not found for call ${id} (sid: ${call.call_sid ?? "none"})`,
+        );
+        return res.status(404).json({
+          success: false,
+          error: "Recording not available yet",
+        });
+      }
+
+      console.log(`🎙️ Streaming recording for call ${id}`);
+      const upstream = await fetchRecordingStream(recordingUrl);
+      if (!upstream.ok) {
+        console.error(
+          `❌ Twilio recording fetch failed for ${id}: ${upstream.status}`,
+        );
+        return res.status(502).json({
+          success: false,
+          error: "Failed to load recording from provider",
+        });
+      }
+
+      const contentType =
+        upstream.headers.get("content-type") || "audio/mpeg";
+      res.setHeader("Content-Type", contentType);
+      res.setHeader("Cache-Control", "private, max-age=3600");
+      const buffer = Buffer.from(await upstream.arrayBuffer());
+      return res.send(buffer);
+    } catch (error) {
+      console.error("Error streaming call recording:", error);
+      return res.status(500).json({
+        success: false,
+        error: "Failed to stream recording",
+      });
+    }
+  },
+);
 
 // GET /api/calls/:id/transcripts - Get transcripts for a call (only if it belongs to the authenticated user)
 router.get(

@@ -30,6 +30,7 @@ import {
   stripQuoteCallMarker,
   usesPriceGatheringCallBehavior,
 } from "../quote/caller-instructions";
+import { buildTakeoverTranscriptContext } from "../services/call-takeover";
 
 // Constants for audio processing and timing thresholds
 const AUDIO_THRESHOLDS = {
@@ -393,8 +394,7 @@ export class GPT4oRealtimeHandler {
       console.log("🔌 Connecting to OpenAI Realtime API...");
 
       this.realtimeConnection = new RealtimeAPIConnection({
-        model:
-          config.openai.realtimeModel || "gpt-4o-realtime-preview-2024-12-17",
+        model: config.openai.realtimeModel || "gpt-realtime",
         voice: this.getVoiceFromPreference(),
         temperature: config.openai.realtimeTemperature,
         max_response_output_tokens: 4096,
@@ -407,13 +407,38 @@ export class GPT4oRealtimeHandler {
         this.handleRealtimeMessage(message);
       });
 
-      // Set system prompt and send configuration
-      const systemPrompt = this.buildSystemPrompt();
+      const isAiTakeoverResume =
+        !!this.call.user_joined_at && !!this.call.ai_takeover_at;
+
+      if (isAiTakeoverResume) {
+        this.hasGivenIntroduction = true;
+      }
+
+      let systemPrompt = this.buildSystemPrompt();
+      if (isAiTakeoverResume && this.call.user_joined_at) {
+        const supplement = await buildTakeoverTranscriptContext(
+          this.call.id,
+          this.call.user_joined_at,
+        );
+        systemPrompt += supplement;
+      }
       this.realtimeConnection.sendConfig(systemPrompt);
 
       console.log("✅ OpenAI Realtime API connected and configured");
 
       this.tryAdvanceFromPreAnswer("realtime_session_ready");
+
+      if (isAiTakeoverResume) {
+        console.log(
+          "🤖 AI takeover resume: prompting Holdless to continue with transcript context",
+        );
+        setTimeout(() => {
+          this.realtimeConnection?.requestResponseWithInstructions(
+            "You are resuming this call after the account owner spoke with the representative. Using the transcript in your instructions, speak first with a brief natural continuation—confirm next steps or ask what is still needed. Do not repeat your full introduction.",
+          );
+        }, 400);
+        return;
+      }
 
       // DO NOT trigger any greeting - the AI must wait for customer service to speak first
       // Customer service will answer the phone and greet the customer
@@ -438,6 +463,56 @@ export class GPT4oRealtimeHandler {
     return (
       voiceMap[this.call.voice_preference || "professional_female"] || "ash"
     );
+  }
+
+  private spellIdentifierForSpeech(value: string): string {
+    const digitWords = [
+      "zero",
+      "one",
+      "two",
+      "three",
+      "four",
+      "five",
+      "six",
+      "seven",
+      "eight",
+      "nine",
+    ];
+    return value
+      .split("")
+      .map((char) => {
+        if (/\d/.test(char)) {
+          return digitWords[parseInt(char, 10)];
+        }
+        return char.toUpperCase();
+      })
+      .join(", ");
+  }
+
+  private extractUserTranscriptFromConversationItem(item: any): string {
+    if (!item || item.role !== "user") {
+      return "";
+    }
+    const parts = Array.isArray(item.content) ? item.content : [];
+    for (const part of parts) {
+      if (typeof part?.transcript === "string" && part.transcript.trim()) {
+        return part.transcript.trim();
+      }
+      if (
+        typeof part?.input_audio?.transcript === "string" &&
+        part.input_audio.transcript.trim()
+      ) {
+        return part.input_audio.transcript.trim();
+      }
+      if (
+        part?.type === "input_audio_transcription" &&
+        typeof part?.transcript === "string" &&
+        part.transcript.trim()
+      ) {
+        return part.transcript.trim();
+      }
+    }
+    return "";
   }
 
   private extractTaggedSection(
@@ -563,29 +638,8 @@ export class GPT4oRealtimeHandler {
       issueDescription = issueMatch ? issueMatch[1].trim() : null;
     }
 
-    // Build order number spelling for introduction
     const orderNumberSpelled = orderNumber
-      ? orderNumber
-          .split("")
-          .map((char) => {
-            if (/\d/.test(char)) {
-              const words = [
-                "zero",
-                "one",
-                "two",
-                "three",
-                "four",
-                "five",
-                "six",
-                "seven",
-                "eight",
-                "nine",
-              ];
-              return words[parseInt(char)];
-            }
-            return char.toUpperCase();
-          })
-          .join(", ")
+      ? this.spellIdentifierForSpeech(orderNumber)
       : null;
 
     // Extract email address
@@ -600,9 +654,24 @@ export class GPT4oRealtimeHandler {
     );
     const phoneNumber = phoneMatch ? phoneMatch[1].trim() : null;
 
+    const memberIdMatch = (purpose + " " + additionalContextPlain).match(
+      /member\s*(?:id|#|number)?\s*:?\s*([A-Za-z0-9-]{4,})/i,
+    );
+    const memberId = memberIdMatch ? memberIdMatch[1].trim() : null;
+    const memberIdSpelled = memberId
+      ? this.spellIdentifierForSpeech(memberId)
+      : null;
+
+    const dobMatch = (purpose + " " + additionalContextPlain).match(
+      /(?:date\s+of\s+birth|dob|birth\s*date)\s*:?\s*(\d{4}-\d{2}-\d{2}|\d{1,2}\/\d{1,2}\/\d{4})/i,
+    );
+    const dateOfBirth = dobMatch ? dobMatch[1].trim() : null;
+
     // Build list of available information
     const availableInfo: string[] = [];
     if (orderNumber) availableInfo.push(`- Order number: ${orderNumber}`);
+    if (memberId) availableInfo.push(`- Member ID: ${memberId}`);
+    if (dateOfBirth) availableInfo.push(`- Date of birth: ${dateOfBirth}`);
     if (emailAddress) availableInfo.push(`- Email address: ${emailAddress}`);
     if (phoneNumber) availableInfo.push(`- Phone number: ${phoneNumber}`);
 
@@ -777,28 +846,16 @@ ${
   orderNumber
     ? `\nCRITICAL: Order number ${orderNumber} found. 
 - DO NOT provide it unless explicitly asked (e.g., "What's your order number?", "How can I help you?", "Can I have your order number?")
-- When asked, SPELL IT OUT character by character: ${orderNumber
-        .split("")
-        .map((char) => {
-          if (/\d/.test(char)) {
-            const words = [
-              "zero",
-              "one",
-              "two",
-              "three",
-              "four",
-              "five",
-              "six",
-              "seven",
-              "eight",
-              "nine",
-            ];
-            return words[parseInt(char)];
-          }
-          return char.toUpperCase();
-        })
-        .join(", ")}
+- When asked, SPELL IT OUT character by character: ${orderNumberSpelled}
 - For simple greetings like "Hello" or "Hi", do NOT include the order number - just introduce yourself and explain why you're calling`
+    : ""
+}
+${
+  memberId && memberIdSpelled
+    ? `\nCRITICAL: Member ID ${memberId} is on file.
+- When asked for member ID, subscriber ID, or policy ID, provide it immediately.
+- Spell it digit by digit: ${memberIdSpelled}
+- Do NOT say you lack the member ID — it is listed in Available info above.`
     : ""
 }
 
@@ -806,6 +863,11 @@ You ONLY have information explicitly stated above. NEVER invent, guess, or fabri
 ${
   !orderNumber
     ? "\n- If order number is NOT listed in Available info above, you do NOT have an order number. If they ask for it, say you don't have it — NEVER say a made-up or example order number."
+    : ""
+}
+${
+  !memberId
+    ? "\n- If member ID is NOT listed in Available info above, you do NOT have a member ID. If they ask for it, say you don't have it."
     : ""
 }
 
@@ -829,8 +891,8 @@ RESPONDING TO DIFFERENT SITUATIONS:
    → Provide your full introduction including the issue and desired outcome
    → Include order number if you have one and they ask for it
 
-3. WHEN ASKED FOR SPECIFIC INFORMATION (order number, email, etc.):
-   → Provide it immediately (order numbers must be spelled character by character)
+3. WHEN ASKED FOR SPECIFIC INFORMATION (order number, member ID, email, date of birth, etc.):
+   → Provide it immediately (order numbers and member IDs must be spelled character by character)
    → 🚨🚨🚨 CRITICAL: When providing information, ONLY provide the information requested - do NOT add any closing phrases like "Thank you for your help", "Thanks", "Goodbye", or any other acknowledgments
    → 🚨🚨🚨 NEVER say "Goodbye" or "Thank you for your help" after providing information - the conversation is NOT ending, you're just answering a question
    → Just give the information directly: "The order number is [spelled out]" or "My email is [email]" - that's it, nothing more
@@ -844,8 +906,9 @@ ${
    → If you don't have it: "I'm sorry, I don't have that information with me right now. I'll need to confirm that with the user and call you back with that information. Is there any other information you'll need when I call back?"
 
 VERIFICATION & PRIVACY:
-- ONLY provide information explicitly stated in purpose/instructions above
-- Look for patterns: "Order Number: X", "order number X", "order #X", "Email: X", "Phone: X", etc.
+- ONLY provide information explicitly stated in purpose/instructions above OR listed in Available info
+- Look for patterns: "Order Number: X", "Member ID: X", "Email: X", "Date of birth: X", "Phone: X", etc.
+- If a field appears in Available info, you HAVE it — never say you lack it
 - If they ask for info you HAVE: provide it (order numbers must be spelled character by character: "12345" → "one, two, three, four, five")
 - 🚨🚨🚨 CRITICAL: When providing information, ONLY state the information - do NOT add "Thank you for your help", "Thanks", "Goodbye", or any other phrases after providing information
 - 🚨🚨🚨 NEVER say goodbye after providing information - asking for information or asking you to repeat information is NOT a signal to end the call
@@ -2791,6 +2854,20 @@ CALL FLOW:
             // This commonly happens when transcription fails due to rate limiting (429 errors)
             // BUT: Only cancel if we haven't sent the greeting yet (allow initial greeting)
             if (this.realtimeConnection && !this.hasSentGreeting) {
+              const sessionReady =
+                this.realtimeConnection.isSessionConfigured();
+              if (!sessionReady) {
+                console.error(
+                  "🛑 CANCELLING response — Realtime session.update did not apply; without session instructions the model speaks as a generic assistant (not your call briefing)",
+                );
+                this.realtimeConnection.cancelResponse();
+                this.isProcessingResponse = false;
+                this.responseStartTime = 0;
+                this.aiHasSpokenAudio = false;
+                this.hasPendingResponseRequest = false;
+                this.shouldStopAudio = false;
+                return;
+              }
               console.log(
                 "🛑 CANCELLING INVALID RESPONSE - No valid user input detected",
               );
@@ -2840,6 +2917,7 @@ CALL FLOW:
           if (
             respondingTo === "(unknown - no transcript tracked)" &&
             this.realtimeConnection &&
+            this.realtimeConnection.isSessionConfigured() &&
             this.shouldCancelSpuriousUnknownResponse()
           ) {
             console.log(
@@ -2942,11 +3020,13 @@ CALL FLOW:
           break;
 
         case "response.audio_transcript.delta":
+        case "response.output_audio_transcript.delta":
           // Partial transcript from AI - don't log (too verbose, only log final transcript)
           // The final transcript will be logged in response.audio_transcript.done
           break;
 
         case "response.audio_transcript.done":
+        case "response.output_audio_transcript.done":
           // Final transcript from AI
           const transcriptText = message.transcript || "";
           if (transcriptText.trim()) {
@@ -3221,6 +3301,7 @@ CALL FLOW:
           break;
 
         case "response.audio.delta":
+        case "response.output_audio.delta":
           // Audio chunk from AI
           // 🚨 CRITICAL: Stop processing audio ONLY if interruption phrase was detected
           // Do NOT block for regular speech or echo - only for explicit interruptions
@@ -3240,6 +3321,7 @@ CALL FLOW:
           break;
 
         case "response.audio.done":
+        case "response.output_audio.done":
           console.log("✅ AI audio response complete");
           if (!this.hasSentFirstAssistantUtterance) {
             this.hasSentFirstAssistantUtterance = true;
@@ -3499,6 +3581,21 @@ CALL FLOW:
         case "conversation.item.created":
           console.log("💬 Conversation item created");
           break;
+
+        case "conversation.item.done": {
+          const gaTranscript = this.extractUserTranscriptFromConversationItem(
+            message.item,
+          );
+          if (gaTranscript.trim()) {
+            console.log(
+              `📨 GA conversation.item.done transcript: "${gaTranscript}"`,
+            );
+            this.latestUserSpeechTimestamp = Date.now();
+            this.lastUserTranscriptForResponse = gaTranscript;
+            this.requestAIResponse(gaTranscript);
+          }
+          break;
+        }
 
         case "conversation.item.input_audio_transcription.failed":
           // Transcription failed - log the error and investigate
@@ -4740,7 +4837,8 @@ CALL FLOW:
           // Log unknown message types for debugging (but not audio deltas to reduce spam)
           if (
             !messageType.includes("audio.delta") &&
-            !messageType.includes("audio_transcript.delta")
+            !messageType.includes("audio_transcript.delta") &&
+            !messageType.includes("output_audio_transcript.delta")
           ) {
             console.log(`ℹ️  Realtime API message: ${messageType}`);
           }

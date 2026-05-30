@@ -54,6 +54,7 @@ export async function initiateCall(call: Call): Promise<void> {
       statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
       record: config.call.recordCalls,
       recordingStatusCallback: statusCallbackUrl,
+      recordingStatusCallbackEvent: ["completed"],
     });
 
     console.log(`✅ Twilio call created: ${twilioCall.sid}`);
@@ -130,6 +131,11 @@ export function conferenceRoomNameForCallId(callId: string): string {
   return `aicc-${callId.toLowerCase()}`;
 }
 
+export function callIdFromConferenceRoom(room: string): string | null {
+  const m = room.trim().match(/^aicc-([0-9a-f-]{36})$/i);
+  return m ? m[1] : null;
+}
+
 export function isValidConferenceRoomName(room: string | undefined | null): boolean {
   if (!room || typeof room !== "string") return false;
   return CONFERENCE_ROOM_RE.test(room.trim());
@@ -182,5 +188,43 @@ export async function connectUserToOngoingConference(
   );
 
   return { user_leg_call_sid: out.sid };
+}
+
+/**
+ * Redirects the CSR (business) leg from a Twilio conference back to the Media Stream so Holdless can resume.
+ */
+export async function reconnectBusinessLegToMediaStream(call: {
+  id: string;
+  call_sid?: string | null;
+}): Promise<void> {
+  if (!call.call_sid?.trim()) {
+    throw new Error("Call has no Twilio CallSid yet");
+  }
+
+  const baseUrl = getPublicBaseUrl();
+  assertPublicWebhookBase(baseUrl);
+  const voiceUrl = `${baseUrl}/api/webhooks/twilio/voice`;
+
+  await twilioClient.calls(call.call_sid).update({
+    url: voiceUrl,
+    method: "POST",
+  });
+
+  console.log(
+    `🤖 AI takeover: business leg ${call.call_sid} redirected to media stream (${voiceUrl})`,
+  );
+}
+
+/** Ends the account owner's conference leg when Holdless resumes. */
+export async function endUserConferenceLeg(userJoinCallSid: string): Promise<void> {
+  try {
+    await twilioClient.calls(userJoinCallSid).update({ status: "completed" });
+    console.log(`🤖 AI takeover: ended user leg ${userJoinCallSid}`);
+  } catch (error) {
+    console.warn(
+      `⚠️ AI takeover: could not end user leg ${userJoinCallSid}:`,
+      error instanceof Error ? error.message : error,
+    );
+  }
 }
 

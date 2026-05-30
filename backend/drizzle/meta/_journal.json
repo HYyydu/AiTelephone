@@ -50,6 +50,13 @@
       "when": 1777345200000,
       "tag": "0006_repair_consume_free_call_request",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1777431600000,
+      "tag": "0007_calls_ai_takeover",
+      "breakpoints": true
     }
   ]
 }

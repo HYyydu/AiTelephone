@@ -34,6 +34,8 @@ function dbCallToCall(dbCall: typeof calls.$inferSelect): Call {
     started_at: dbCall.started_at || undefined,
     ended_at: dbCall.ended_at || undefined,
     user_joined_at: dbCall.user_joined_at || undefined,
+    user_join_call_sid: dbCall.user_join_call_sid || undefined,
+    ai_takeover_at: dbCall.ai_takeover_at || undefined,
     duration_seconds: dbCall.duration || undefined,
     call_sid: dbCall.call_sid || undefined,
     recording_url: dbCall.recording_url || undefined,
@@ -60,6 +62,8 @@ function callToDbCall(call: Call): typeof calls.$inferInsert {
     started_at: call.started_at || null,
     ended_at: call.ended_at || null,
     user_joined_at: call.user_joined_at || null,
+    user_join_call_sid: call.user_join_call_sid || null,
+    ai_takeover_at: call.ai_takeover_at || null,
     duration: call.duration_seconds || null,
     call_sid: call.call_sid || null,
     recording_url: call.recording_url || null,
@@ -296,6 +300,8 @@ export class CallService {
       if (updates.input_tokens !== undefined) dbUpdates.input_tokens = updates.input_tokens;
       if (updates.output_tokens !== undefined) dbUpdates.output_tokens = updates.output_tokens;
       if (updates.user_joined_at !== undefined) dbUpdates.user_joined_at = updates.user_joined_at;
+      if (updates.user_join_call_sid !== undefined) dbUpdates.user_join_call_sid = updates.user_join_call_sid;
+      if (updates.ai_takeover_at !== undefined) dbUpdates.ai_takeover_at = updates.ai_takeover_at;
 
       const [updated] = await db
         .update(calls)
